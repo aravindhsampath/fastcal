@@ -1,0 +1,12 @@
+# Rust build output
+/target
+**/*.rs.bk
+
+# Editor / OS / tooling noise
+.DS_Store
+.claude/
+*.swp
+*.swo
+
+# Local scratch dir (docs references, notes)
+references/

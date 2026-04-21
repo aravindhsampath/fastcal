@@ -14,6 +14,11 @@ categories = ["command-line-utilities"]
 # CalDAV client (proven with Fastmail)
 libdav = "0.10"
 
+# IANA timezone database — lets us honor TZID parameters on DTSTART/DTEND
+# ("Asia/Kolkata:20260423T143000") and convert correctly to UTC.
+# Compatible with chrono 0.4.
+chrono-tz = "0.10"
+
 # Async runtime
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time"] }
 futures-util = "0.3"

@@ -539,6 +539,7 @@ dependencies = [
  "log",
  "mockito",
  "predicates",
+ "roxmltree",
  "rpassword",
  "serde",
  "serde_json",

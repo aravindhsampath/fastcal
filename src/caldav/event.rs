@@ -7,6 +7,7 @@
 //!
 //! Uses ListCalendarResources and GetCalendarResources from libdav.
 
+use super::calendar_query_expand::CalendarQueryExpand;
 use super::Client;
 use crate::models::Event;
 use crate::parsers::datetime::format_for_ics;
@@ -15,10 +16,18 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use libdav::caldav::{GetCalendarResources, ListCalendarResources};
 
-/// List events in a calendar within a date range
+/// List events in a calendar within a date range.
 ///
-/// Uses libdav's ListCalendarResources for metadata listing and
-/// GetCalendarResources to fetch full event data.
+/// Two code paths:
+/// - **Range query (both `from` and `to` set)**: sends a CALDAV
+///   `calendar-query` REPORT with `<C:expand>` so the server pre-expands
+///   recurring events into one VEVENT per instance within the range.
+///   Each expanded instance comes back with its own DTSTART and a
+///   RECURRENCE-ID. One round trip; no separate fetch.
+/// - **Open-ended query (either side missing)**: falls back to libdav's
+///   two-step flow (list hrefs → multi-get). Recurring events return as
+///   master VEVENTs with RRULE intact; clients can inspect `rrule` on
+///   the Event struct if they need to reason about the pattern.
 pub async fn list_events(
     client: &Client,
     calendar_href: &str,
@@ -32,6 +41,48 @@ pub async fn list_events(
         from,
         to
     );
+
+    // --- Fast path: bounded range → server-side expand ----------------
+    // Recurring events with RRULE need the server to materialize their
+    // per-instance VEVENTs for the range we care about. libdav 0.10 has
+    // no expand support; we use our own DavRequest in calendar_query_expand.
+    if let (Some(start), Some(end)) = (from, to) {
+        log::debug!("Using server-side <C:expand> for range {start} → {end}");
+        let req = CalendarQueryExpand::new(calendar_href, start, end);
+        let resp = client
+            .request(req)
+            .await
+            .context("Failed calendar-query with expand")?;
+        log::info!(
+            "Server returned {} expanded instance(s)",
+            resp.resources.len()
+        );
+
+        let mut events = Vec::new();
+        for resource in resp.resources {
+            match &resource.content {
+                Ok(fetched) => match ics::parse_event(
+                    &fetched.data,
+                    resource.href.clone(),
+                    Some(fetched.etag.clone()),
+                ) {
+                    Ok(mut event) => {
+                        event.calendar = calendar_name.clone();
+                        events.push(event);
+                    }
+                    Err(e) => log::debug!(
+                        "Skipping unparseable expanded event {}: {}",
+                        resource.href,
+                        e
+                    ),
+                },
+                Err(status) => log::debug!("Skipping event {}: HTTP {}", resource.href, status),
+            }
+        }
+        return Ok(events);
+    }
+
+    // --- Slow path: open-ended range, existing two-step flow ----------
 
     // Step 1: List event hrefs with optional filtering
     // Need to keep datetime strings alive for the duration of the request

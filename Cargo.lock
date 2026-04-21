@@ -525,6 +525,7 @@ dependencies = [
  "base64",
  "calcard",
  "chrono",
+ "chrono-tz",
  "clap",
  "clap_complete",
  "dirs",

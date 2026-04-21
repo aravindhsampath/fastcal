@@ -9,7 +9,9 @@
 use crate::models::{Attendee, Event, EventDateTime, EventStatus};
 use anyhow::{Context, Result};
 use calcard::icalendar::ICalendar;
-use chrono::{DateTime, Duration, NaiveDate, NaiveDateTime, Utc};
+use chrono::{DateTime, Duration, LocalResult, NaiveDate, NaiveDateTime, TimeZone, Utc};
+use chrono_tz::Tz;
+use log::warn;
 
 /// Parse ICS data into an Event
 pub fn parse_event(ics_data: &str, href: String, etag: Option<String>) -> Result<Event> {
@@ -49,14 +51,17 @@ pub fn parse_event(ics_data: &str, href: String, etag: Option<String>) -> Result
     // Extract location
     let location = extract_property(&unfolded, "LOCATION");
 
-    // Extract start time (required)
-    let dtstart = extract_property(&unfolded, "DTSTART").context("No DTSTART found in event")?;
-    let (start_dt, start_tz, all_day) = parse_datetime(&dtstart)?;
+    // Extract start time (required). Uses the TZID-aware extractor so
+    // `DTSTART;TZID=Asia/Kolkata:20260423T143000` round-trips correctly
+    // instead of being silently flattened as UTC.
+    let (dtstart_val, dtstart_tzid) =
+        extract_dt_property(&unfolded, "DTSTART").context("No DTSTART found in event")?;
+    let (start_dt, start_tz, all_day) = parse_datetime(&dtstart_val, dtstart_tzid.as_deref())?;
     let start = EventDateTime::new(start_dt.clone(), start_tz.clone());
 
     // Extract end time
-    let end = if let Some(dtend) = extract_property(&unfolded, "DTEND") {
-        let (end_dt, end_tz, _) = parse_datetime(&dtend)?;
+    let end = if let Some((dtend_val, dtend_tzid)) = extract_dt_property(&unfolded, "DTEND") {
+        let (end_dt, end_tz, _) = parse_datetime(&dtend_val, dtend_tzid.as_deref())?;
         EventDateTime::new(end_dt, end_tz)
     } else if let Some(duration_str) = extract_property(&unfolded, "DURATION") {
         if let Ok(duration_secs) = parse_duration(&duration_str) {
@@ -85,13 +90,15 @@ pub fn parse_event(ics_data: &str, href: String, etag: Option<String>) -> Result
         });
 
     // Extract created/modified timestamps
+    // CREATED / LAST-MODIFIED are defined by RFC 5545 to always be UTC
+    // (end with 'Z'), so TZID isn't meaningful for them — pass `None`.
     let created = extract_property(&unfolded, "CREATED")
-        .and_then(|s| parse_datetime(&s).ok())
+        .and_then(|s| parse_datetime(&s, None).ok())
         .and_then(|(dt, _, _)| DateTime::parse_from_rfc3339(&dt).ok())
         .map(|dt| dt.with_timezone(&Utc));
 
     let modified = extract_property(&unfolded, "LAST-MODIFIED")
-        .and_then(|s| parse_datetime(&s).ok())
+        .and_then(|s| parse_datetime(&s, None).ok())
         .and_then(|(dt, _, _)| DateTime::parse_from_rfc3339(&dt).ok())
         .map(|dt| dt.with_timezone(&Utc));
 
@@ -203,10 +210,25 @@ fn unescape_ics_text(text: &str) -> String {
     result
 }
 
-/// Parse datetime from ICS format
-/// Returns (ISO 8601 string, timezone, is_all_day)
-fn parse_datetime(dt_str: &str) -> Result<(String, Option<String>, bool)> {
-    // Check if it's a DATE (all-day event) - format YYYYMMDD
+/// Parse an ICS datetime value, honoring a TZID parameter when present.
+///
+/// Returns `(rfc3339_string, timezone_name, is_all_day)`.
+///
+/// Three input shapes:
+/// - `YYYYMMDD` (8 chars, no 'T'): all-day date → `(YYYY-MM-DD, None, true)`.
+/// - `YYYYMMDDTHHMMSSZ`: UTC → round-trip as-is.
+/// - `YYYYMMDDTHHMMSS` + `tzid`: local time in `tzid`, convert to UTC.
+/// - `YYYYMMDDTHHMMSS` + no tzid: "floating" per RFC 5545, no authoritative
+///   zone available server-side. We log and fall back to treating it as
+///   UTC. Real-world Fastmail events almost always carry Z or TZID, so
+///   this path is defensive.
+///
+/// DST handling: for ambiguous local times (e.g. 02:30 on a fall-back
+/// night that happens twice), we pick the *earlier* instant. For
+/// non-existent local times (02:30 on a spring-forward night), we
+/// return an error — the ICS is malformed.
+fn parse_datetime(dt_str: &str, tzid: Option<&str>) -> Result<(String, Option<String>, bool)> {
+    // Date-only (all-day) — TZID (if any) is ignored, matching RFC 5545.
     if dt_str.len() == 8 && !dt_str.contains('T') {
         let year = &dt_str[0..4];
         let month = &dt_str[4..6];
@@ -215,15 +237,108 @@ fn parse_datetime(dt_str: &str) -> Result<(String, Option<String>, bool)> {
         return Ok((iso_date, None, true));
     }
 
-    // Check if it's UTC (ends with Z)
+    // Trailing 'Z' is explicit UTC. TZID on a Z-suffixed value is
+    // technically a spec violation; we treat Z as authoritative.
     if dt_str.ends_with('Z') {
         let dt = parse_ics_datetime(dt_str)?;
-        return Ok((dt.to_rfc3339(), Some("UTC".to_string()), false));
+        return Ok((dt.to_rfc3339(), Some("UTC".to_owned()), false));
     }
 
-    // Otherwise, it's a local datetime (treat as UTC for now)
+    if let Some(tz_name) = tzid {
+        let tz: Tz = tz_name
+            .parse()
+            .with_context(|| format!("unknown IANA timezone `{tz_name}`"))?;
+        let naive = NaiveDateTime::parse_from_str(dt_str, "%Y%m%dT%H%M%S")
+            .context("Failed to parse ICS datetime")?;
+        let local = match tz.from_local_datetime(&naive) {
+            LocalResult::Single(dt) => dt,
+            LocalResult::Ambiguous(earlier, _) => earlier,
+            LocalResult::None => {
+                anyhow::bail!(
+                    "local time {naive} does not exist in timezone `{tz_name}` \
+                     (likely a DST spring-forward gap)"
+                );
+            }
+        };
+        let utc: DateTime<Utc> = local.with_timezone(&Utc);
+        return Ok((utc.to_rfc3339(), Some(tz.name().to_owned()), false));
+    }
+
+    // Floating time (no Z, no TZID). RFC 5545 says this should be
+    // interpreted in the observer's local timezone — which we don't
+    // know server-side. Falling back to UTC keeps behavior consistent
+    // with historical fastcal; the warning surfaces the ambiguity.
     let dt = parse_ics_datetime(dt_str)?;
+    warn!(
+        "floating-time event without TZID (`{dt_str}`) — treating as UTC; \
+         this may render with a wall-clock offset."
+    );
     Ok((dt.to_rfc3339(), None, false))
+}
+
+/// Like [`extract_property`], but for datetime properties that can carry
+/// a `TZID=...` parameter (DTSTART, DTEND, RECURRENCE-ID). Returns
+/// `(value, tzid_opt)`.
+///
+/// Examples:
+/// - `DTSTART;TZID=Asia/Kolkata:20260423T143000`
+///   → `("20260423T143000", Some("Asia/Kolkata"))`
+/// - `DTSTART:20260423T143000Z` → `("20260423T143000Z", None)`
+/// - `DTSTART;VALUE=DATE:20260423` → `("20260423", None)`
+/// - `DTSTART;TZID=Europe/Amsterdam;OTHER=X:20260305T100000`
+///   → `("20260305T100000", Some("Europe/Amsterdam"))`
+///
+/// Scoped to VEVENT components, same as [`extract_property`], so
+/// VTIMEZONE's DAYLIGHT/STANDARD DTSTART lines don't leak through.
+fn extract_dt_property(ics_data: &str, property_name: &str) -> Option<(String, Option<String>)> {
+    let mut in_vevent = false;
+    let mut depth = 0;
+
+    for line in ics_data.lines() {
+        let line = line.trim();
+
+        if line == "BEGIN:VEVENT" {
+            in_vevent = true;
+            depth = 0;
+            continue;
+        }
+        if line == "END:VEVENT" {
+            in_vevent = false;
+            continue;
+        }
+        if in_vevent && line.starts_with("BEGIN:") {
+            depth += 1;
+            continue;
+        }
+        if in_vevent && line.starts_with("END:") {
+            depth -= 1;
+            continue;
+        }
+
+        if !(in_vevent && depth == 0 && line.starts_with(property_name)) {
+            continue;
+        }
+        let Some(rest) = line.strip_prefix(property_name) else {
+            continue;
+        };
+        // Require ':' or ';' immediately after the name — otherwise a
+        // property like `DTSTARTFOO:` could match when looking for
+        // `DTSTART`.
+        let (params_blob, value) = match rest.chars().next() {
+            Some(':') => ("", &rest[1..]),
+            Some(';') => {
+                let after_semi = &rest[1..];
+                let colon = after_semi.find(':')?;
+                (&after_semi[..colon], &after_semi[colon + 1..])
+            }
+            _ => continue,
+        };
+        let tzid = params_blob
+            .split(';')
+            .find_map(|kv| kv.strip_prefix("TZID=").map(str::to_owned));
+        return Some((value.trim().to_owned(), tzid));
+    }
+    None
 }
 
 /// Parse ICS datetime format (YYYYMMDDTHHMMSSexpZ) to DateTime
@@ -807,5 +922,143 @@ END:VCALENDAR"#;
             extract_property(ics, "SUMMARY"),
             Some("Real Event".to_string())
         );
+    }
+
+    // -------- TZID-aware DTSTART/DTEND parsing (fix/timezones) --------
+
+    /// Helper: minimal VCALENDAR wrapping a single VEVENT with a DTSTART
+    /// line of the caller's choosing. No DTEND — events_parse computes
+    /// one from duration or defaults. Keeps each test case readable.
+    fn ics_with_dtstart(dtstart_line: &str) -> String {
+        format!(
+            "BEGIN:VCALENDAR\nVERSION:2.0\nBEGIN:VEVENT\nUID:t\nSUMMARY:X\n\
+             {dtstart_line}\nEND:VEVENT\nEND:VCALENDAR"
+        )
+    }
+
+    #[test]
+    fn extract_dt_property_reads_tzid_from_params() {
+        let ics = ics_with_dtstart("DTSTART;TZID=Asia/Kolkata:20260423T143000");
+        let got = extract_dt_property(&ics, "DTSTART").unwrap();
+        assert_eq!(got.0, "20260423T143000");
+        assert_eq!(got.1.as_deref(), Some("Asia/Kolkata"));
+    }
+
+    #[test]
+    fn extract_dt_property_with_no_params_has_no_tzid() {
+        let ics = ics_with_dtstart("DTSTART:20260423T143000Z");
+        let got = extract_dt_property(&ics, "DTSTART").unwrap();
+        assert_eq!(got.0, "20260423T143000Z");
+        assert!(got.1.is_none());
+    }
+
+    #[test]
+    fn extract_dt_property_survives_multiple_params() {
+        // Real-world calendars sometimes add VALUE=DATE-TIME alongside TZID.
+        let ics = ics_with_dtstart("DTSTART;VALUE=DATE-TIME;TZID=Europe/Amsterdam:20260305T100000");
+        let got = extract_dt_property(&ics, "DTSTART").unwrap();
+        assert_eq!(got.0, "20260305T100000");
+        assert_eq!(got.1.as_deref(), Some("Europe/Amsterdam"));
+    }
+
+    #[test]
+    fn extract_dt_property_all_day_date() {
+        let ics = ics_with_dtstart("DTSTART;VALUE=DATE:20260423");
+        let got = extract_dt_property(&ics, "DTSTART").unwrap();
+        assert_eq!(got.0, "20260423");
+        assert!(got.1.is_none());
+    }
+
+    #[test]
+    fn extract_dt_property_does_not_false_match_prefix() {
+        // Guard: DTSTARTFOO must not match DTSTART.
+        let ics = ics_with_dtstart("DTSTARTFOO:notreal\nDTSTART:20260423T143000Z");
+        let got = extract_dt_property(&ics, "DTSTART").unwrap();
+        assert_eq!(got.0, "20260423T143000Z");
+    }
+
+    #[test]
+    fn parse_datetime_tzid_kolkata_converts_to_utc() {
+        // 14:30 IST (+05:30) == 09:00 UTC. This is the exact case that
+        // made calman display 20:00 instead of 14:30 before the fix.
+        let (iso, tz, all_day) = parse_datetime("20260423T143000", Some("Asia/Kolkata")).unwrap();
+        assert_eq!(iso, "2026-04-23T09:00:00+00:00");
+        assert_eq!(tz.as_deref(), Some("Asia/Kolkata"));
+        assert!(!all_day);
+    }
+
+    #[test]
+    fn parse_datetime_tzid_amsterdam_cest_converts_to_utc() {
+        // April 23 is during Central European Summer Time (UTC+02:00).
+        // 11:00 CEST == 09:00 UTC.
+        let (iso, tz, _) = parse_datetime("20260423T110000", Some("Europe/Amsterdam")).unwrap();
+        assert_eq!(iso, "2026-04-23T09:00:00+00:00");
+        assert_eq!(tz.as_deref(), Some("Europe/Amsterdam"));
+    }
+
+    #[test]
+    fn parse_datetime_tzid_amsterdam_cet_converts_to_utc() {
+        // January is Central European Time (UTC+01:00). 11:00 CET == 10:00 UTC.
+        // Verifies chrono_tz gives us the right offset for the date, not
+        // a fixed "Europe/Amsterdam is always +02:00" assumption.
+        let (iso, _, _) = parse_datetime("20260115T110000", Some("Europe/Amsterdam")).unwrap();
+        assert_eq!(iso, "2026-01-15T10:00:00+00:00");
+    }
+
+    #[test]
+    fn parse_datetime_utc_z_suffix_unchanged() {
+        // Regression guard: the explicit-UTC path must keep working.
+        let (iso, tz, _) = parse_datetime("20260423T143000Z", None).unwrap();
+        assert_eq!(iso, "2026-04-23T14:30:00+00:00");
+        assert_eq!(tz.as_deref(), Some("UTC"));
+    }
+
+    #[test]
+    fn parse_datetime_all_day_date_unchanged() {
+        let (iso, tz, all_day) = parse_datetime("20260423", None).unwrap();
+        assert_eq!(iso, "2026-04-23");
+        assert!(tz.is_none());
+        assert!(all_day);
+    }
+
+    #[test]
+    fn parse_datetime_floating_without_tzid_falls_back_to_utc() {
+        // Floating time with no TZID: we log a warning and keep the
+        // historical "treat as UTC" behavior. The warning is not
+        // asserted here — only the compatible shape.
+        let (iso, tz, _) = parse_datetime("20260423T143000", None).unwrap();
+        assert_eq!(iso, "2026-04-23T14:30:00+00:00");
+        assert!(tz.is_none());
+    }
+
+    #[test]
+    fn parse_datetime_unknown_tzid_errors() {
+        // Unknown tz name should surface as an error rather than
+        // silently defaulting somewhere wrong.
+        let err = parse_datetime("20260423T143000", Some("Totally/Fake")).unwrap_err();
+        assert!(
+            err.to_string().to_lowercase().contains("unknown"),
+            "expected 'unknown' in error: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_event_end_to_end_tzid_kolkata() {
+        // Integration: the exact ICS shape a Fastmail event with an
+        // India-time TZID would take. The user's "Bevestiging" case.
+        let ics = r#"BEGIN:VCALENDAR
+VERSION:2.0
+BEGIN:VEVENT
+UID:test-kolkata
+DTSTART;TZID=Asia/Kolkata:20260423T143000
+DTEND;TZID=Asia/Kolkata:20260423T150000
+SUMMARY:Dentist
+END:VEVENT
+END:VCALENDAR"#;
+        let event = parse_event(ics, "/h.ics".to_owned(), None).unwrap();
+        assert_eq!(event.start.datetime, "2026-04-23T09:00:00+00:00");
+        assert_eq!(event.end.datetime, "2026-04-23T09:30:00+00:00");
+        assert_eq!(event.start.timezone.as_deref(), Some("Asia/Kolkata"));
+        assert_eq!(event.duration_minutes, Some(30));
     }
 }

@@ -69,6 +69,25 @@ pub struct Event {
     /// ETag for optimistic concurrency control
     #[serde(skip_serializing_if = "Option::is_none")]
     pub etag: Option<String>,
+
+    /// iCalendar recurrence rule, preserved verbatim (e.g.
+    /// `"FREQ=WEEKLY;BYDAY=MO"`). Present on a master event; absent on
+    /// non-recurring events and on expanded per-instance rows. A UI or
+    /// agent can use this to explain "this is a weekly event" without
+    /// needing to re-parse the ICS.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rrule: Option<String>,
+
+    /// RFC 5545 RECURRENCE-ID: the original start time of a specific
+    /// occurrence of a recurring event. Present when this row is an
+    /// expanded instance (e.g. returned from a server-side `<expand>`
+    /// query, or stored as an overridden occurrence of a master).
+    /// Absent on the master event itself and on non-recurring events.
+    ///
+    /// Stored as an RFC 3339 UTC string for consistency with
+    /// `start`/`end`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recurrence_id: Option<String>,
 }
 
 /// Event date/time with timezone

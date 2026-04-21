@@ -109,6 +109,16 @@ pub fn parse_event(ics_data: &str, href: String, etag: Option<String>) -> Result
     // Extract attendees
     let attendees = extract_attendees(&unfolded);
 
+    // Recurrence rule, preserved verbatim. Present on master events of a
+    // series; absent on single events and on server-expanded instances.
+    let rrule = extract_property(&unfolded, "RRULE");
+
+    // RECURRENCE-ID: present on an expanded instance or an overridden
+    // occurrence. Can carry a TZID, so reuse the TZID-aware extractor.
+    let recurrence_id = extract_dt_property(&unfolded, "RECURRENCE-ID")
+        .and_then(|(val, tz)| parse_datetime(&val, tz.as_deref()).ok())
+        .map(|(iso, _, _)| iso);
+
     Ok(Event {
         id,
         href,
@@ -126,6 +136,8 @@ pub fn parse_event(ics_data: &str, href: String, etag: Option<String>) -> Result
         organizer,
         all_day,
         etag,
+        rrule,
+        recurrence_id,
     })
 }
 
@@ -1060,5 +1072,70 @@ END:VCALENDAR"#;
         assert_eq!(event.end.datetime, "2026-04-23T09:30:00+00:00");
         assert_eq!(event.start.timezone.as_deref(), Some("Asia/Kolkata"));
         assert_eq!(event.duration_minutes, Some(30));
+    }
+
+    // -------- Recurrence: RRULE + RECURRENCE-ID exposure -------------
+
+    #[test]
+    fn parse_event_exposes_rrule_on_master() {
+        // Weekly Monday gym: the master event carries an RRULE, no
+        // RECURRENCE-ID. Non-recurring events have both as None.
+        let ics = r#"BEGIN:VCALENDAR
+VERSION:2.0
+BEGIN:VEVENT
+UID:gym-master
+DTSTART;TZID=Europe/Berlin:20260202T080000
+DTEND;TZID=Europe/Berlin:20260202T090000
+RRULE:FREQ=WEEKLY;BYDAY=MO
+SUMMARY:Gym
+END:VEVENT
+END:VCALENDAR"#;
+        let event = parse_event(ics, "/g.ics".to_owned(), None).unwrap();
+        assert_eq!(event.rrule.as_deref(), Some("FREQ=WEEKLY;BYDAY=MO"));
+        assert!(event.recurrence_id.is_none(), "master has no RECURRENCE-ID");
+    }
+
+    #[test]
+    fn parse_event_exposes_recurrence_id_on_expanded_instance() {
+        // Server-side `<C:expand>` emits one VEVENT per occurrence, each
+        // carrying a RECURRENCE-ID pointing back at its slot in the
+        // master's series. The instance's DTSTART is the instance time;
+        // the RECURRENCE-ID agrees for a non-overridden instance.
+        let ics = r#"BEGIN:VCALENDAR
+VERSION:2.0
+BEGIN:VEVENT
+UID:gym-master
+RECURRENCE-ID;TZID=Europe/Berlin:20260427T080000
+DTSTART;TZID=Europe/Berlin:20260427T080000
+DTEND;TZID=Europe/Berlin:20260427T090000
+SUMMARY:Gym
+END:VEVENT
+END:VCALENDAR"#;
+        let event = parse_event(ics, "/g.ics".to_owned(), None).unwrap();
+        // Berlin is CEST (+02:00) on Apr 27 → 08:00 local = 06:00 UTC.
+        assert_eq!(event.start.datetime, "2026-04-27T06:00:00+00:00");
+        assert_eq!(
+            event.recurrence_id.as_deref(),
+            Some("2026-04-27T06:00:00+00:00")
+        );
+        assert!(event.rrule.is_none(), "expanded instance has no RRULE");
+    }
+
+    #[test]
+    fn parse_event_non_recurring_has_neither_field() {
+        // Regression guard: one-off events keep both fields as None so
+        // downstream consumers (serde skip_serializing_if) emit neither.
+        let ics = r#"BEGIN:VCALENDAR
+VERSION:2.0
+BEGIN:VEVENT
+UID:one-off
+DTSTART:20260501T140000Z
+DTEND:20260501T150000Z
+SUMMARY:Dentist
+END:VEVENT
+END:VCALENDAR"#;
+        let event = parse_event(ics, "/o.ics".to_owned(), None).unwrap();
+        assert!(event.rrule.is_none());
+        assert!(event.recurrence_id.is_none());
     }
 }

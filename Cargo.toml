@@ -19,6 +19,12 @@ libdav = "0.10"
 # Compatible with chrono 0.4.
 chrono-tz = "0.10"
 
+# XML parser for our custom calendar-query REPORT responses — libdav
+# uses this transitively, we pin the same version to avoid duplicate
+# trees. Needed because libdav 0.10 doesn't expose `<C:expand>` and
+# we build that request ourselves.
+roxmltree = "0.21"
+
 # Async runtime
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time"] }
 futures-util = "0.3"

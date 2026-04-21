@@ -7,6 +7,7 @@
 
 pub mod auth;
 pub mod calendar;
+pub mod calendar_query_expand;
 pub mod client;
 pub mod event;
 pub mod utils;

@@ -6,7 +6,7 @@
 use crate::caldav;
 use crate::commands::batch::EventInput;
 use crate::config::Config;
-use crate::models::Event;
+use crate::models::{Event, Reminder};
 use anyhow::{Context, Result};
 
 /// Find a single event by ID, optionally scoped to one calendar.
@@ -83,6 +83,19 @@ pub(crate) async fn create_event_on_server(
             .collect::<Vec<_>>()
     });
 
+    // Materialize a single-element Vec when a reminder was requested;
+    // empty otherwise. `build_event` emits exactly one VALARM per entry.
+    let reminders: Vec<Reminder> = event_input
+        .reminder_minutes
+        .map(|m| {
+            vec![Reminder {
+                minutes_before: m,
+                action: "display".to_owned(),
+                description: None,
+            }]
+        })
+        .unwrap_or_default();
+
     // Build ICS event
     let ics_data = crate::parsers::ics::build_event(&crate::parsers::ics::IcsBuildArgs {
         uid: &uid,
@@ -93,6 +106,7 @@ pub(crate) async fn create_event_on_server(
         location: event_input.location.as_deref(),
         organizer: Some(organizer_username),
         attendees: attendee_list.as_deref(),
+        reminders: &reminders,
     })
     .context("Failed to build ICS event")?;
 

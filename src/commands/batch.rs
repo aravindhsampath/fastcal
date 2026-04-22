@@ -25,6 +25,12 @@ pub struct EventInput {
     pub description: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub attendees: Option<String>,
+    /// DISPLAY reminder N minutes before event start. `None` ⇒ no
+    /// reminder on this event. Exists on the shared batch input so
+    /// `fastcal batch create --from-json file.json` can carry
+    /// reminders per-event alongside the required fields.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reminder_minutes: Option<u32>,
 }
 
 /// Result of a single batch operation

@@ -88,6 +88,40 @@ pub struct Event {
     /// `start`/`end`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub recurrence_id: Option<String>,
+
+    /// VALARM sub-components attached to this event. Populated from the
+    /// ICS on read; on create/update fastcal emits one VALARM per entry.
+    ///
+    /// Only relative "minutes before start" triggers round-trip cleanly
+    /// today (`TRIGGER:-PT<N>M`, `-PT<N>H`, `-P<N>D` are normalized to
+    /// minutes). Absolute-time triggers and `RELATED=END` are skipped on
+    /// read with a debug log and cannot be expressed on write.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reminders: Vec<Reminder>,
+}
+
+/// A VALARM attached to an event, normalized to "minutes before start."
+///
+/// See RFC 5545 §3.6.6. MVP supports only `DISPLAY` action with relative
+/// trigger before start; the field carries the action verbatim on read
+/// so future actions (EMAIL, AUDIO) round-trip without a schema change.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Reminder {
+    /// Minutes before the event's start the alarm fires. `0` means "at
+    /// start" (still a valid VALARM trigger). Hours and days get folded
+    /// in at parse time (1 hour → 60, 1 day → 1440).
+    pub minutes_before: u32,
+
+    /// VALARM `ACTION` property, lowercased. Typically `"display"`.
+    /// fastcal always writes `"display"`; on read, whatever the event
+    /// carries is preserved so the shape is stable across round-trip.
+    pub action: String,
+
+    /// VALARM `DESCRIPTION` property. Only present when the source ICS
+    /// had one; on write, fastcal defaults to the event's SUMMARY when
+    /// this is `None` (Fastmail's notification UI expects some text).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
 }
 
 /// Event date/time with timezone

@@ -6,12 +6,12 @@
 //! Uses the calcard crate for robust RFC 5545 compliant parsing.
 //! Handles line folding, property parameters, and all iCalendar edge cases.
 
-use crate::models::{Attendee, Event, EventDateTime, EventStatus};
+use crate::models::{Attendee, Event, EventDateTime, EventStatus, Reminder};
 use anyhow::{Context, Result};
 use calcard::icalendar::ICalendar;
 use chrono::{DateTime, Duration, LocalResult, NaiveDate, NaiveDateTime, TimeZone, Utc};
 use chrono_tz::Tz;
-use log::warn;
+use log::{debug, warn};
 
 /// Parse ICS data into an Event
 pub fn parse_event(ics_data: &str, href: String, etag: Option<String>) -> Result<Event> {
@@ -119,6 +119,11 @@ pub fn parse_event(ics_data: &str, href: String, etag: Option<String>) -> Result
         .and_then(|(val, tz)| parse_datetime(&val, tz.as_deref()).ok())
         .map(|(iso, _, _)| iso);
 
+    // VALARM sub-components: one `Reminder` per supported VALARM block.
+    // Absolute-time / RELATED=END triggers are silently dropped with a
+    // debug log — see `extract_valarms` for the supported shapes.
+    let reminders = extract_valarms(&unfolded);
+
     Ok(Event {
         id,
         href,
@@ -138,7 +143,202 @@ pub fn parse_event(ics_data: &str, href: String, etag: Option<String>) -> Result
         etag,
         rrule,
         recurrence_id,
+        reminders,
     })
+}
+
+/// Scan VEVENT for VALARM sub-components and normalize each into a
+/// [`Reminder`]. Only supported shape is a relative-before-start trigger
+/// expressed as `-PT<N>M`, `-PT<N>H`, or `-P<N>D` (optionally combined:
+/// `-PT1H30M`). Absolute triggers (`TRIGGER;VALUE=DATE-TIME:...`) and
+/// `RELATED=END` are dropped with a `debug!` — the caller loses them on
+/// round-trip, which is acceptable for the MVP.
+///
+/// Input is expected to be unfolded (see [`unfold_ics`]).
+fn extract_valarms(unfolded: &str) -> Vec<Reminder> {
+    let mut out = Vec::new();
+    let mut in_vevent = false;
+    let mut in_valarm = false;
+    // Per-VALARM collectors — reset on BEGIN:VALARM.
+    let mut action: Option<String> = None;
+    let mut trigger_raw: Option<String> = None;
+    let mut trigger_has_params = false;
+    let mut description: Option<String> = None;
+
+    for line in unfolded.lines() {
+        let line = line.trim();
+
+        if line == "BEGIN:VEVENT" {
+            in_vevent = true;
+            continue;
+        }
+        if line == "END:VEVENT" {
+            in_vevent = false;
+            in_valarm = false;
+            continue;
+        }
+        if !in_vevent {
+            continue;
+        }
+
+        if line == "BEGIN:VALARM" {
+            in_valarm = true;
+            action = None;
+            trigger_raw = None;
+            trigger_has_params = false;
+            description = None;
+            continue;
+        }
+        if line == "END:VALARM" {
+            if let Some(reminder) = finalize_valarm(
+                action.take(),
+                trigger_raw.take(),
+                trigger_has_params,
+                description.take(),
+            ) {
+                out.push(reminder);
+            }
+            trigger_has_params = false;
+            in_valarm = false;
+            continue;
+        }
+        if !in_valarm {
+            continue;
+        }
+
+        // Inside a VALARM — pick up the three properties we care about.
+        // `TRIGGER` may carry parameters (`TRIGGER;VALUE=DATE-TIME:...`
+        // or `TRIGGER;RELATED=END:-PT5M`) — record whether any appear so
+        // we can reject non-default shapes at finalize time.
+        if let Some(rest) = line.strip_prefix("ACTION") {
+            if let Some(val) = value_after_colon(rest) {
+                action = Some(val.to_ascii_lowercase());
+            }
+        } else if let Some(rest) = line.strip_prefix("TRIGGER") {
+            match rest.chars().next() {
+                Some(':') => {
+                    trigger_raw = Some(rest[1..].trim().to_owned());
+                }
+                Some(';') => {
+                    trigger_has_params = true;
+                    if let Some(val) = value_after_colon(rest) {
+                        trigger_raw = Some(val.to_owned());
+                    }
+                }
+                _ => {}
+            }
+        } else if let Some(rest) = line.strip_prefix("DESCRIPTION") {
+            if let Some(val) = value_after_colon(rest) {
+                description = Some(unescape_ics_text(val));
+            }
+        }
+    }
+
+    out
+}
+
+/// Return the substring after the first `:` of a property-suffix (the
+/// portion after the property name). `rest` starts with either `:` or
+/// `;PARAM=VAL...:`. Returns `None` if neither is true.
+fn value_after_colon(rest: &str) -> Option<&str> {
+    match rest.chars().next()? {
+        ':' => Some(rest[1..].trim()),
+        ';' => {
+            let colon = rest.find(':')?;
+            Some(rest[colon + 1..].trim())
+        }
+        _ => None,
+    }
+}
+
+/// Combine the three collected VALARM properties into a `Reminder`, or
+/// `None` if the TRIGGER isn't a supported shape.
+///
+/// Supported: `-PT<N>M`, `-PT<N>H`, `-P<N>D`, `-PT<H>H<M>M` — anything
+/// starting with `-P` and consisting of optional days then optional
+/// hours+minutes+seconds. Absolute datetimes (`20260423T...`) and
+/// RELATED=END (marked by `trigger_has_params`) are rejected.
+fn finalize_valarm(
+    action: Option<String>,
+    trigger: Option<String>,
+    trigger_has_params: bool,
+    description: Option<String>,
+) -> Option<Reminder> {
+    // `RELATED=END`, `VALUE=DATE-TIME`, or any other param → punt for now.
+    // The MVP only cares about the default "relative to start" shape.
+    if trigger_has_params {
+        debug!(
+            "valarm: skipping TRIGGER with params (likely RELATED=END or VALUE=DATE-TIME) \
+             — not supported in MVP"
+        );
+        return None;
+    }
+    let trigger = trigger?;
+    let minutes_before = parse_relative_before_start(&trigger)?;
+    Some(Reminder {
+        minutes_before,
+        action: action.unwrap_or_else(|| "display".to_owned()),
+        description,
+    })
+}
+
+/// Parse a "negative duration before event start" trigger like `-PT5M`,
+/// `-PT1H`, `-P1D`, or `-PT1H30M` into whole minutes. Returns `None` on:
+/// - missing leading `-` (post-event triggers aren't supported on write,
+///   but we drop them on read too rather than bolt on signed minutes)
+/// - missing leading `P`
+/// - any non-zero seconds component (we round down — but log it)
+/// - unrecognized grammar
+fn parse_relative_before_start(trigger: &str) -> Option<u32> {
+    let after_sign = trigger.strip_prefix('-')?;
+    let after_p = after_sign.strip_prefix('P')?;
+
+    let (date_part, time_part) = match after_p.find('T') {
+        Some(idx) => (&after_p[..idx], Some(&after_p[idx + 1..])),
+        None => (after_p, None),
+    };
+
+    let mut minutes: u32 = 0;
+
+    if !date_part.is_empty() {
+        // Accept days and weeks (rare but spec-valid).
+        let mut rest = date_part;
+        while !rest.is_empty() {
+            let letter_pos = rest.find(|c: char| c.is_ascii_alphabetic())?;
+            let value: u32 = rest[..letter_pos].parse().ok()?;
+            match rest.as_bytes()[letter_pos] {
+                b'D' => minutes = minutes.checked_add(value.checked_mul(1440)?)?,
+                b'W' => minutes = minutes.checked_add(value.checked_mul(7 * 1440)?)?,
+                _ => return None,
+            }
+            rest = &rest[letter_pos + 1..];
+        }
+    }
+
+    if let Some(mut rest) = time_part {
+        while !rest.is_empty() {
+            let letter_pos = rest.find(|c: char| c.is_ascii_alphabetic())?;
+            let value: u32 = rest[..letter_pos].parse().ok()?;
+            match rest.as_bytes()[letter_pos] {
+                b'H' => minutes = minutes.checked_add(value.checked_mul(60)?)?,
+                b'M' => minutes = minutes.checked_add(value)?,
+                b'S' => {
+                    // Sub-minute precision discarded; log once so surprising
+                    // round-trips ("4:59 reminder became 4 min") are traceable.
+                    if value != 0 {
+                        debug!(
+                            "valarm: TRIGGER `{trigger}` has seconds component — \
+                             rounding down to whole minutes"
+                        );
+                    }
+                }
+                _ => return None,
+            }
+            rest = &rest[letter_pos + 1..];
+        }
+    }
+
+    Some(minutes)
 }
 
 /// Extract a property value from ICS data, scoped to the VEVENT section
@@ -545,6 +745,11 @@ pub struct IcsBuildArgs<'a> {
     pub location: Option<&'a str>,
     pub organizer: Option<&'a str>,
     pub attendees: Option<&'a [String]>,
+    /// VALARM sub-components to emit. Empty ⇒ no VALARM block written.
+    /// MVP only writes `ACTION:DISPLAY` + `TRIGGER:-PT<N>M` even if the
+    /// source `Reminder` has a different action — we don't produce
+    /// VALARM shapes we can't also parse back.
+    pub reminders: &'a [Reminder],
 }
 
 /// Build an ICS calendar containing a single event
@@ -560,6 +765,7 @@ pub fn build_event(args: &IcsBuildArgs<'_>) -> Result<String> {
         location,
         organizer,
         attendees,
+        reminders,
     } = args;
     let mut ics = String::new();
 
@@ -609,6 +815,23 @@ pub fn build_event(args: &IcsBuildArgs<'_>) -> Result<String> {
     }
 
     ics.push_str("STATUS:CONFIRMED\r\n");
+
+    // One VALARM block per reminder. We always emit DISPLAY + a
+    // relative-minutes trigger so everything we write can round-trip
+    // through our own parser. DESCRIPTION defaults to SUMMARY since
+    // Fastmail's notification UI wants some text.
+    for r in *reminders {
+        ics.push_str("BEGIN:VALARM\r\n");
+        ics.push_str(&fold_line("ACTION:DISPLAY"));
+        ics.push_str(&fold_line(&format!("TRIGGER:-PT{}M", r.minutes_before)));
+        let desc = r.description.as_deref().unwrap_or(summary);
+        ics.push_str(&fold_line(&format!(
+            "DESCRIPTION:{}",
+            escape_ics_text(desc)
+        )));
+        ics.push_str("END:VALARM\r\n");
+    }
+
     ics.push_str("END:VEVENT\r\n");
     ics.push_str("END:VCALENDAR\r\n");
 
@@ -687,6 +910,7 @@ mod tests {
             location: None,
             organizer: None,
             attendees: None,
+            reminders: &[],
         })
         .unwrap();
 
@@ -710,6 +934,7 @@ mod tests {
             location: Some("Conference Room A"),
             organizer: Some("organizer@example.com"),
             attendees: Some(&attendees),
+            reminders: &[],
         })
         .unwrap();
 
@@ -1119,6 +1344,215 @@ END:VCALENDAR"#;
             Some("2026-04-27T06:00:00+00:00")
         );
         assert!(event.rrule.is_none(), "expanded instance has no RRULE");
+    }
+
+    // -------- VALARM / reminder parse + build + round-trip ----------
+
+    /// Minimal VCALENDAR wrapping a single VEVENT with caller-supplied
+    /// VALARM-block lines.
+    fn ics_with_valarms(valarm_body: &str) -> String {
+        format!(
+            "BEGIN:VCALENDAR\nVERSION:2.0\nBEGIN:VEVENT\n\
+             UID:test-reminder\nSUMMARY:Test\n\
+             DTSTART:20260501T140000Z\nDTEND:20260501T150000Z\n\
+             {valarm_body}\n\
+             END:VEVENT\nEND:VCALENDAR"
+        )
+    }
+
+    #[test]
+    fn parse_event_exposes_5min_reminder() {
+        let ics = ics_with_valarms(
+            "BEGIN:VALARM\nACTION:DISPLAY\nTRIGGER:-PT5M\nDESCRIPTION:ping\nEND:VALARM",
+        );
+        let ev = parse_event(&ics, "/h.ics".to_owned(), None).unwrap();
+        assert_eq!(ev.reminders.len(), 1);
+        assert_eq!(ev.reminders[0].minutes_before, 5);
+        assert_eq!(ev.reminders[0].action, "display");
+        assert_eq!(ev.reminders[0].description.as_deref(), Some("ping"));
+    }
+
+    #[test]
+    fn parse_event_reports_multiple_reminders() {
+        let ics = ics_with_valarms(
+            "BEGIN:VALARM\nACTION:DISPLAY\nTRIGGER:-PT15M\nEND:VALARM\n\
+             BEGIN:VALARM\nACTION:DISPLAY\nTRIGGER:-P1D\nEND:VALARM",
+        );
+        let ev = parse_event(&ics, "/h.ics".to_owned(), None).unwrap();
+        assert_eq!(ev.reminders.len(), 2);
+        assert_eq!(ev.reminders[0].minutes_before, 15);
+        assert_eq!(ev.reminders[1].minutes_before, 1440);
+    }
+
+    #[test]
+    fn parse_event_handles_hour_and_day_triggers() {
+        // -PT1H → 60, -P1D → 1440, -PT1H30M → 90
+        let ics = ics_with_valarms(
+            "BEGIN:VALARM\nACTION:DISPLAY\nTRIGGER:-PT1H\nEND:VALARM\n\
+             BEGIN:VALARM\nACTION:DISPLAY\nTRIGGER:-P1D\nEND:VALARM\n\
+             BEGIN:VALARM\nACTION:DISPLAY\nTRIGGER:-PT1H30M\nEND:VALARM",
+        );
+        let ev = parse_event(&ics, "/h.ics".to_owned(), None).unwrap();
+        let mins: Vec<u32> = ev.reminders.iter().map(|r| r.minutes_before).collect();
+        assert_eq!(mins, vec![60, 1440, 90]);
+    }
+
+    #[test]
+    fn parse_event_skips_absolute_trigger() {
+        // TRIGGER;VALUE=DATE-TIME — not supported, dropped.
+        let ics = ics_with_valarms(
+            "BEGIN:VALARM\nACTION:DISPLAY\n\
+             TRIGGER;VALUE=DATE-TIME:20260501T135500Z\n\
+             END:VALARM",
+        );
+        let ev = parse_event(&ics, "/h.ics".to_owned(), None).unwrap();
+        assert!(ev.reminders.is_empty());
+    }
+
+    #[test]
+    fn parse_event_skips_related_end_trigger() {
+        // TRIGGER;RELATED=END:-PT5M — not supported in MVP, dropped.
+        let ics =
+            ics_with_valarms("BEGIN:VALARM\nACTION:DISPLAY\nTRIGGER;RELATED=END:-PT5M\nEND:VALARM");
+        let ev = parse_event(&ics, "/h.ics".to_owned(), None).unwrap();
+        assert!(ev.reminders.is_empty());
+    }
+
+    #[test]
+    fn parse_event_without_valarm_has_empty_reminders() {
+        let ics = r#"BEGIN:VCALENDAR
+VERSION:2.0
+BEGIN:VEVENT
+UID:plain
+DTSTART:20260501T140000Z
+DTEND:20260501T150000Z
+SUMMARY:Plain
+END:VEVENT
+END:VCALENDAR"#;
+        let ev = parse_event(ics, "/p.ics".to_owned(), None).unwrap();
+        assert!(ev.reminders.is_empty());
+    }
+
+    #[test]
+    fn parse_relative_before_start_grammar() {
+        assert_eq!(parse_relative_before_start("-PT5M"), Some(5));
+        assert_eq!(parse_relative_before_start("-PT0M"), Some(0));
+        assert_eq!(parse_relative_before_start("-PT1H"), Some(60));
+        assert_eq!(parse_relative_before_start("-P1D"), Some(1440));
+        assert_eq!(parse_relative_before_start("-PT1H30M"), Some(90));
+        assert_eq!(parse_relative_before_start("-P1DT2H"), Some(1440 + 120));
+        assert_eq!(parse_relative_before_start("-P1W"), Some(7 * 1440));
+        // Positive (after-start) triggers not supported here.
+        assert_eq!(parse_relative_before_start("PT5M"), None);
+        // Absolute datetime not a duration.
+        assert_eq!(parse_relative_before_start("-20260501T140000Z"), None);
+        // Gibberish.
+        assert_eq!(parse_relative_before_start("-Pxyz"), None);
+    }
+
+    #[test]
+    fn build_event_emits_no_valarm_when_reminders_empty() {
+        // Regression guard: the default path must stay byte-stable for
+        // events without reminders. A VALARM block appearing here would
+        // silently change every event the calman agent touches.
+        let ics = build_event(&IcsBuildArgs {
+            uid: "no-alarm",
+            summary: "Plain",
+            start: "20260501T140000Z",
+            end: "20260501T150000Z",
+            description: None,
+            location: None,
+            organizer: None,
+            attendees: None,
+            reminders: &[],
+        })
+        .unwrap();
+        assert!(!ics.contains("BEGIN:VALARM"));
+        assert!(!ics.contains("TRIGGER"));
+    }
+
+    #[test]
+    fn build_event_emits_valarm_when_reminder_present() {
+        let reminders = vec![Reminder {
+            minutes_before: 5,
+            action: "display".to_owned(),
+            description: None,
+        }];
+        let ics = build_event(&IcsBuildArgs {
+            uid: "with-alarm",
+            summary: "Car check",
+            start: "20260501T170000Z",
+            end: "20260501T173000Z",
+            description: None,
+            location: None,
+            organizer: None,
+            attendees: None,
+            reminders: &reminders,
+        })
+        .unwrap();
+        assert!(ics.contains("BEGIN:VALARM\r\n"));
+        assert!(ics.contains("ACTION:DISPLAY\r\n"));
+        assert!(ics.contains("TRIGGER:-PT5M\r\n"));
+        // DESCRIPTION defaults to the event's SUMMARY when caller omits it.
+        assert!(ics.contains("DESCRIPTION:Car check\r\n"));
+        assert!(ics.contains("END:VALARM\r\n"));
+    }
+
+    #[test]
+    fn build_event_with_multiple_reminders_emits_all() {
+        let reminders = vec![
+            Reminder {
+                minutes_before: 15,
+                action: "display".to_owned(),
+                description: None,
+            },
+            Reminder {
+                minutes_before: 1440,
+                action: "display".to_owned(),
+                description: None,
+            },
+        ];
+        let ics = build_event(&IcsBuildArgs {
+            uid: "multi-alarm",
+            summary: "Big day",
+            start: "20260501T100000Z",
+            end: "20260501T110000Z",
+            description: None,
+            location: None,
+            organizer: None,
+            attendees: None,
+            reminders: &reminders,
+        })
+        .unwrap();
+        assert_eq!(ics.matches("BEGIN:VALARM").count(), 2);
+        assert!(ics.contains("TRIGGER:-PT15M"));
+        assert!(ics.contains("TRIGGER:-PT1440M"));
+    }
+
+    #[test]
+    fn valarm_round_trip_preserves_minutes_before() {
+        let original = vec![Reminder {
+            minutes_before: 30,
+            action: "display".to_owned(),
+            description: Some("pickup".to_owned()),
+        }];
+        let ics = build_event(&IcsBuildArgs {
+            uid: "rt",
+            summary: "Pickup",
+            start: "20260501T170000Z",
+            end: "20260501T180000Z",
+            description: None,
+            location: None,
+            organizer: None,
+            attendees: None,
+            reminders: &original,
+        })
+        .unwrap();
+        let parsed = parse_event(&ics, "/rt.ics".to_owned(), None).unwrap();
+        assert_eq!(parsed.reminders.len(), 1);
+        assert_eq!(parsed.reminders[0].minutes_before, 30);
+        assert_eq!(parsed.reminders[0].action, "display");
+        assert_eq!(parsed.reminders[0].description.as_deref(), Some("pickup"));
     }
 
     #[test]

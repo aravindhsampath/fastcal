@@ -147,6 +147,12 @@ pub enum EventCommands {
         #[arg(long)]
         attendees: Option<String>,
 
+        /// Set a DISPLAY reminder N minutes before the event start.
+        /// Repeat with larger numbers for hours / days
+        /// (e.g. 60 for 1 hour, 1440 for 1 day). Omit for no reminder.
+        #[arg(long)]
+        reminder_minutes: Option<u32>,
+
         /// Create event from JSON file (fields can be overridden by other flags)
         #[arg(long)]
         from_json: Option<String>,
@@ -179,6 +185,17 @@ pub enum EventCommands {
         /// New attendees (comma-separated emails)
         #[arg(long)]
         attendees: Option<String>,
+
+        /// Replace all existing VALARMs with a single DISPLAY reminder
+        /// N minutes before start. Omit to leave the event's existing
+        /// reminders untouched; pass `--no-reminders` to strip them.
+        #[arg(long, conflicts_with = "no_reminders")]
+        reminder_minutes: Option<u32>,
+
+        /// Strip all VALARMs from the event. Mutually exclusive with
+        /// `--reminder-minutes`.
+        #[arg(long)]
+        no_reminders: bool,
     },
 
     /// Delete event
@@ -303,6 +320,7 @@ impl Cli {
                         location,
                         description,
                         attendees,
+                        reminder_minutes,
                         from_json,
                     } => {
                         events::create(
@@ -315,6 +333,7 @@ impl Cli {
                                 location,
                                 description,
                                 attendees,
+                                reminder_minutes,
                             },
                             from_json,
                         )
@@ -328,6 +347,8 @@ impl Cli {
                         location,
                         description,
                         attendees,
+                        reminder_minutes,
+                        no_reminders,
                     } => {
                         events::update(
                             &ctx,
@@ -339,6 +360,8 @@ impl Cli {
                                 location,
                                 description,
                                 attendees,
+                                reminder_minutes,
+                                no_reminders,
                             },
                         )
                         .await

@@ -142,6 +142,7 @@ pub struct EventCreateOverrides {
     pub location: Option<String>,
     pub description: Option<String>,
     pub attendees: Option<String>,
+    pub reminder_minutes: Option<u32>,
 }
 
 /// Execute events create command
@@ -162,13 +163,14 @@ pub async fn create(
         location,
         description,
         attendees,
+        reminder_minutes,
     } = overrides;
     let config = ctx
         .load_config()
         .context("Failed to load configuration. Run 'fastcal config init' first.")?;
 
     // Resolve fields: load JSON defaults first, then let CLI args override
-    let (summary, start, end, duration, location, description, attendees) =
+    let (summary, start, end, duration, location, description, attendees, reminder_minutes) =
         if let Some(ref path) = from_json {
             let contents = std::fs::read_to_string(path)
                 .with_context(|| format!("Failed to read JSON file: {}", path))?;
@@ -182,6 +184,7 @@ pub async fn create(
                 location.or(json_event.location),
                 description.or(json_event.description),
                 attendees.or(json_event.attendees),
+                reminder_minutes.or(json_event.reminder_minutes),
             )
         } else {
             let summary = summary
@@ -196,6 +199,7 @@ pub async fn create(
                 location,
                 description,
                 attendees,
+                reminder_minutes,
             )
         };
 
@@ -228,6 +232,7 @@ pub async fn create(
         location,
         description,
         attendees,
+        reminder_minutes,
     };
 
     // Dry-run: compute what would be created without hitting the server
@@ -261,8 +266,20 @@ pub async fn create(
                 if let Some(ref att) = event_input.attendees {
                     println!("  Attendees:{}", att);
                 }
+                if let Some(mins) = event_input.reminder_minutes {
+                    println!("  Reminder: {} minutes before", mins);
+                }
             }
             OutputFormat::Json => {
+                // Mirror the `Reminder` shape that parse→serialize would
+                // produce, so a dry-run preview and a real create emit the
+                // same field names downstream.
+                let reminders_json = event_input.reminder_minutes.map(|m| {
+                    json!([{
+                        "minutes_before": m,
+                        "action": "display",
+                    }])
+                });
                 let response = SuccessResponse::new(json!({
                     "dry_run": true,
                     "would_create": {
@@ -273,6 +290,7 @@ pub async fn create(
                         "location": event_input.location,
                         "description": event_input.description,
                         "attendees": event_input.attendees,
+                        "reminders": reminders_json,
                         "calendar": calendar_name,
                     }
                 }));
@@ -454,6 +472,14 @@ pub struct EventUpdatePatch {
     pub location: Option<String>,
     pub description: Option<String>,
     pub attendees: Option<String>,
+    /// When `Some(n)`, replace all existing VALARMs with a single
+    /// DISPLAY reminder `n` minutes before start. When `None`, leave
+    /// the existing reminders untouched (unless `no_reminders` is set).
+    pub reminder_minutes: Option<u32>,
+    /// When `true`, strip every VALARM from the event on PUT. Mutually
+    /// exclusive with `reminder_minutes` at the CLI layer; we don't
+    /// re-enforce here so internal callers can opt for "clear" cleanly.
+    pub no_reminders: bool,
 }
 
 /// Updates an existing event in the calendar
@@ -469,6 +495,8 @@ pub async fn update(
         location,
         description,
         attendees,
+        reminder_minutes,
+        no_reminders,
     } = patch;
     let config = ctx
         .load_config()
@@ -573,8 +601,26 @@ pub async fn update(
         changed = true;
     }
 
+    // Reminder changes are applied after content fields so they don't
+    // interact with the "was anything changed?" guard below. Update
+    // semantics (from VALARM_PLAN.md §4):
+    //   - `reminder_minutes = Some(n)` → replace all VALARMs with one
+    //   - `no_reminders = true`         → strip all VALARMs
+    //   - neither                       → leave event.reminders alone
+    if let Some(mins) = reminder_minutes {
+        event.reminders = vec![crate::models::Reminder {
+            minutes_before: mins,
+            action: "display".to_owned(),
+            description: None,
+        }];
+        changed = true;
+    } else if no_reminders && !event.reminders.is_empty() {
+        event.reminders.clear();
+        changed = true;
+    }
+
     if !changed {
-        anyhow::bail!("No changes specified. Use --summary, --start, --end, --location, --description, or --attendees");
+        anyhow::bail!("No changes specified. Use --summary, --start, --end, --location, --description, --attendees, --reminder-minutes, or --no-reminders");
     }
 
     // Dry-run: show the modified event without PUTting to the server
@@ -620,6 +666,7 @@ pub async fn update(
         location: event.location.as_deref(),
         organizer: Some(&config.server.username),
         attendees: attendee_emails.as_deref(),
+        reminders: &event.reminders,
     })
     .context("Failed to build updated ICS event")?;
 

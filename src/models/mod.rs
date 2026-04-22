@@ -10,5 +10,5 @@ pub mod event;
 pub mod output;
 
 pub use calendar::Calendar;
-pub use event::{Attendee, Event, EventDateTime, EventStatus};
+pub use event::{Attendee, Event, EventDateTime, EventStatus, Reminder};
 pub use output::{ErrorResponse, Metadata, SuccessResponse};

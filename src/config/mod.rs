@@ -73,7 +73,9 @@ fn default_calendar() -> String {
 }
 
 fn default_timezone() -> String {
-    "America/Los_Angeles".to_string()
+    // No baked-in zone: a config missing this field falls back to the host
+    // system zone (and ultimately UTC), never a surprising fixed locale.
+    crate::timezone::detect_system_tz()
 }
 
 fn default_output_format() -> String {

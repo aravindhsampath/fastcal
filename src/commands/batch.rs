@@ -6,9 +6,14 @@
 use crate::caldav;
 use crate::models::SuccessResponse;
 use anyhow::{Context, Result};
+use futures_util::stream::StreamExt;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::fs;
+
+/// Max in-flight requests for a batch operation. Bounds connections/fds so a
+/// large batch doesn't open one socket per event (server throttling / EMFILE).
+const MAX_BATCH_CONCURRENCY: usize = 8;
 
 /// Event creation input (used by both single-create and batch-create)
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -100,23 +105,38 @@ pub async fn create(
         .context("Failed to create CalDAV client")?;
 
     let total = events.len();
-    eprintln!("Dispatching {} create request(s) concurrently...", total);
+    let tz = ctx.timezone;
+    eprintln!(
+        "Dispatching {} create request(s) ({} at a time)...",
+        total, MAX_BATCH_CONCURRENCY
+    );
 
-    // Execute all creates concurrently
-    let raw_results: Vec<(usize, Result<String>)> =
-        futures_util::future::join_all(events.iter().enumerate().map(|(index, event_input)| {
-            let client = &client;
-            let config = &config;
-            let calendar_name = &calendar_name;
-            let calendar_href = &calendar_href;
-            async move {
-                let result =
-                    create_single_event(client, config, calendar_name, calendar_href, event_input)
-                        .await;
-                (index, result)
-            }
-        }))
-        .await;
+    // Bounded concurrency: at most MAX_BATCH_CONCURRENCY creates in flight.
+    let mut raw_results: Vec<(usize, Result<String>)> =
+        futures_util::stream::iter(events.iter().enumerate())
+            .map(|(index, event_input)| {
+                let client = &client;
+                let config = &config;
+                let calendar_name = &calendar_name;
+                let calendar_href = &calendar_href;
+                async move {
+                    let result = create_single_event(
+                        client,
+                        config,
+                        calendar_name,
+                        calendar_href,
+                        event_input,
+                        tz,
+                    )
+                    .await;
+                    (index, result)
+                }
+            })
+            .buffer_unordered(MAX_BATCH_CONCURRENCY)
+            .collect()
+            .await;
+    // buffer_unordered yields in completion order; restore input order.
+    raw_results.sort_by_key(|(index, _)| *index);
 
     // Collect results in order
     let mut results = Vec::new();
@@ -172,12 +192,14 @@ async fn create_single_event(
     _calendar_name: &str,
     calendar_href: &str,
     event_input: &EventInput,
+    tz: chrono_tz::Tz,
 ) -> Result<String> {
     crate::commands::helpers::create_event_on_server(
         client,
         calendar_href,
         &config.server.username,
         event_input,
+        tz,
     )
     .await
 }
@@ -228,20 +250,27 @@ pub async fn delete(
 
     let total = event_ids.len();
     let calendar_filter = ctx.calendar.clone();
-    eprintln!("Dispatching {} delete request(s) concurrently...", total);
+    eprintln!(
+        "Dispatching {} delete request(s) ({} at a time)...",
+        total, MAX_BATCH_CONCURRENCY
+    );
 
-    // Execute all deletes concurrently
-    let raw_results: Vec<(usize, String, Result<()>)> =
-        futures_util::future::join_all(event_ids.iter().enumerate().map(|(index, event_id)| {
-            let client = &client;
-            let config = &config;
-            let filter = calendar_filter.as_deref();
-            async move {
-                let result = delete_single_event(client, config, event_id, filter).await;
-                (index, event_id.clone(), result)
-            }
-        }))
-        .await;
+    // Bounded concurrency: at most MAX_BATCH_CONCURRENCY deletes in flight.
+    let mut raw_results: Vec<(usize, String, Result<()>)> =
+        futures_util::stream::iter(event_ids.iter().enumerate())
+            .map(|(index, event_id)| {
+                let client = &client;
+                let config = &config;
+                let filter = calendar_filter.as_deref();
+                async move {
+                    let result = delete_single_event(client, config, event_id, filter).await;
+                    (index, event_id.clone(), result)
+                }
+            })
+            .buffer_unordered(MAX_BATCH_CONCURRENCY)
+            .collect()
+            .await;
+    raw_results.sort_by_key(|(index, _, _)| *index);
 
     // Collect results in order
     let mut results = Vec::new();

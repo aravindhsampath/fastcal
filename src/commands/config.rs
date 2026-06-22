@@ -78,6 +78,12 @@ pub async fn init(_ctx: &crate::commands::context::CommandContext) -> Result<()>
     let mut config = Config::minimal(username, password);
     config::discovery::update_config_with_discovery(&mut config, discovery_result);
 
+    // Pre-fill the timezone from the host system so a fresh setup matches
+    // where the user actually is (instead of a baked-in default).
+    let detected_tz = crate::timezone::detect_system_tz();
+    println!("  Detected timezone: {}", detected_tz);
+    config.preferences.default_timezone = detected_tz;
+
     // Save config
     let config_path = Config::config_path()?;
     config.save().context("Failed to save configuration")?;
@@ -172,9 +178,6 @@ pub async fn show(ctx: &crate::commands::context::CommandContext) -> Result<()> 
             }));
             println!("{}", serde_json::to_string_pretty(&response)?);
         }
-        OutputFormat::Ics => {
-            anyhow::bail!("ICS format is not applicable to config commands");
-        }
     }
 
     Ok(())
@@ -198,11 +201,14 @@ pub async fn set(
             config.preferences.default_calendar = value.clone();
         }
         "preferences.default_timezone" => {
+            // Validate up front so a bad zone can't be persisted and then
+            // break every later command at resolution time.
+            crate::timezone::parse_tz(&value).context("cannot set default_timezone")?;
             config.preferences.default_timezone = value.clone();
         }
         "preferences.output_format" => {
-            if !["json", "ics", "text"].contains(&value.as_str()) {
-                anyhow::bail!("Invalid output format. Must be: json, ics, or text");
+            if !["json", "text"].contains(&value.as_str()) {
+                anyhow::bail!("Invalid output format. Must be: json or text");
             }
             config.preferences.output_format = value.clone();
         }
@@ -224,9 +230,6 @@ pub async fn set(
                 "message": format!("Configuration updated: {} = {}", key, value)
             }));
             println!("{}", serde_json::to_string_pretty(&response)?);
-        }
-        OutputFormat::Ics => {
-            anyhow::bail!("ICS format is not applicable to config commands");
         }
     }
 
@@ -261,12 +264,8 @@ pub async fn test(ctx: &crate::commands::context::CommandContext) -> Result<()> 
 
     use libdav::caldav::FindCalendarHomeSet;
 
-    let principal_uri: http::Uri = principal_url
-        .parse()
-        .context("Failed to parse principal URL from config")?;
-
     match client
-        .request(FindCalendarHomeSet::new(&principal_uri))
+        .request(FindCalendarHomeSet::new(principal_url))
         .await
     {
         Ok(home_sets) => {
@@ -290,9 +289,6 @@ pub async fn test(ctx: &crate::commands::context::CommandContext) -> Result<()> 
                         "calendars_configured": config.calendars.len(),
                     }));
                     println!("{}", serde_json::to_string_pretty(&response)?);
-                }
-                OutputFormat::Ics => {
-                    anyhow::bail!("ICS format is not applicable to config commands");
                 }
             }
             Ok(())

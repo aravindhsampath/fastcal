@@ -23,9 +23,11 @@
 //! This module implements that request type directly against libdav's
 //! public `DavRequest` trait. No libdav-internal helpers touched.
 
+use crate::parsers::datetime::format_for_ics;
 use chrono::{DateTime, Utc};
-use http::{response::Parts, Method};
-use libdav::requests::{DavRequest, ParseResponseError, PreparedRequest};
+use http::{response::Parts, Method, Request, Uri};
+use libdav::dav::make_relative_url;
+use libdav::requests::{DavRequest, ParseResponseError};
 use libdav::{FetchedResource, FetchedResourceContent};
 use roxmltree::Document;
 
@@ -76,14 +78,6 @@ impl<'a> CalendarQueryExpand<'a> {
     }
 }
 
-/// Format a UTC datetime as an iCalendar-form string (`YYYYMMDDTHHMMSSZ`).
-/// Duplicated locally — there's a similar function in `caldav::utils`
-/// but it's `pub(crate)` inside that module and we don't want to
-/// reach into it.
-fn format_for_ics(dt: &DateTime<Utc>) -> String {
-    dt.format("%Y%m%dT%H%M%SZ").to_string()
-}
-
 /// Response from a [`CalendarQueryExpand`]. Shape matches libdav's
 /// `GetCalendarResourcesResponse` — one `FetchedResource` per row.
 #[derive(Debug)]
@@ -96,7 +90,7 @@ impl DavRequest for CalendarQueryExpand<'_> {
     type ParseError = ParseResponseError;
     type Error<E> = libdav::dav::WebDavError<E>;
 
-    fn prepare_request(&self) -> Result<PreparedRequest, http::Error> {
+    fn prepare_request(&self, base_url: Uri) -> Result<Request<String>, http::Error> {
         // String-built XML: the body is static-shaped and we only
         // interpolate two attribute values (which are restricted to
         // digits + 'T'/'Z' by our own serializer — no user input), so
@@ -122,18 +116,14 @@ impl DavRequest for CalendarQueryExpand<'_> {
             e = self.end_utc
         );
 
-        Ok(PreparedRequest {
-            method: Method::from_bytes(b"REPORT")?,
-            path: self.collection_href.to_string(),
-            body,
-            headers: vec![
-                ("Depth".to_string(), "1".to_string()),
-                (
-                    "Content-Type".to_string(),
-                    r#"application/xml; charset="utf-8""#.to_string(),
-                ),
-            ],
-        })
+        // libdav 0.10.5 moved request building to `http::Request`: we resolve
+        // the collection href against the client's base URL ourselves.
+        Request::builder()
+            .method(Method::from_bytes(b"REPORT")?)
+            .uri(make_relative_url(base_url, self.collection_href)?)
+            .header("Depth", "1")
+            .header("Content-Type", r#"application/xml; charset="utf-8""#)
+            .body(body)
     }
 
     fn parse_response(
@@ -250,29 +240,32 @@ mod tests {
         let start = Utc.with_ymd_and_hms(2026, 4, 27, 0, 0, 0).unwrap();
         let end = Utc.with_ymd_and_hms(2026, 4, 28, 0, 0, 0).unwrap();
         let req = CalendarQueryExpand::new("/cal/x/", start, end);
-        let prepared = req.prepare_request().unwrap();
+        let prepared = req
+            .prepare_request(Uri::from_static("https://dav.example.com"))
+            .unwrap();
 
-        assert_eq!(prepared.method.as_str(), "REPORT");
-        assert_eq!(prepared.path, "/cal/x/");
-        assert!(
-            prepared.body.contains("C:expand"),
-            "body: {}",
-            prepared.body
-        );
-        assert!(prepared.body.contains("C:time-range"));
+        assert_eq!(prepared.method().as_str(), "REPORT");
+        assert_eq!(prepared.uri().path(), "/cal/x/");
+        let body = prepared.body();
+        assert!(body.contains("C:expand"), "body: {body}");
+        assert!(body.contains("C:time-range"));
         // Both start/end should appear in the body (in expand + time-range).
-        let starts = prepared.body.matches("20260427T000000Z").count();
-        let ends = prepared.body.matches("20260428T000000Z").count();
-        assert_eq!(starts, 2, "start must appear in expand + time-range");
-        assert_eq!(ends, 2, "end must appear in expand + time-range");
+        assert_eq!(
+            body.matches("20260427T000000Z").count(),
+            2,
+            "start must appear in expand + time-range"
+        );
+        assert_eq!(
+            body.matches("20260428T000000Z").count(),
+            2,
+            "end must appear in expand + time-range"
+        );
         // Depth and content-type headers.
-        assert!(
-            prepared
-                .headers
-                .iter()
-                .any(|(k, v)| k == "Depth" && v == "1"),
+        assert_eq!(
+            prepared.headers().get("Depth").map(|v| v.to_str().unwrap()),
+            Some("1"),
             "headers: {:?}",
-            prepared.headers
+            prepared.headers()
         );
     }
 

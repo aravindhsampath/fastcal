@@ -73,9 +73,6 @@ pub async fn list(ctx: &crate::commands::context::CommandContext) -> Result<()> 
             );
             println!("{}", serde_json::to_string_pretty(&response)?);
         }
-        OutputFormat::Ics => {
-            anyhow::bail!("ICS format not yet implemented");
-        }
     }
 
     Ok(())
@@ -136,9 +133,6 @@ pub async fn info(
                 }
             }));
             println!("{}", serde_json::to_string_pretty(&response)?);
-        }
-        OutputFormat::Ics => {
-            anyhow::bail!("ICS format not yet implemented");
         }
     }
 

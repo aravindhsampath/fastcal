@@ -74,12 +74,8 @@ pub async fn discover(mut client: Client) -> Result<DiscoveryResult> {
     let mut calendar_home_sets = Vec::new();
 
     if let Some(ref principal_url) = principal {
-        let principal_uri: http::Uri = principal_url
-            .parse()
-            .context("Failed to parse principal URL")?;
-
         let home_set_response = client
-            .request(FindCalendarHomeSet::new(&principal_uri))
+            .request(FindCalendarHomeSet::new(principal_url))
             .await
             .context("Failed to find calendar home sets")?;
 
@@ -99,12 +95,8 @@ pub async fn discover(mut client: Client) -> Result<DiscoveryResult> {
     for home_set_url in &calendar_home_sets {
         log::debug!("Searching for calendars in: {}", home_set_url);
 
-        let home_set_uri: http::Uri = home_set_url
-            .parse()
-            .context("Failed to parse home set URL")?;
-
         let calendar_response = client
-            .request(FindCalendars::new(&home_set_uri))
+            .request(FindCalendars::new(home_set_url))
             .await
             .context("Failed to find calendars")?;
 

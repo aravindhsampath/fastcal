@@ -46,6 +46,11 @@ toml = "0.8"
 # Date/time handling
 chrono = { version = "0.4", features = ["serde"] }
 
+# System timezone detection (setup-time default + last-resort fallback for
+# resolving the user's IANA zone). chrono-tz above turns the IANA name into
+# a DST-aware Tz.
+iana-time-zone = "0.1"
+
 # iCalendar parsing/generation (for libdav responses)
 calcard = "0.3"
 

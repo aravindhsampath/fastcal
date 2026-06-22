@@ -8,7 +8,7 @@
 
 use crate::models::{Attendee, Event, EventDateTime, EventStatus, Reminder};
 use anyhow::{Context, Result};
-use calcard::icalendar::ICalendar;
+use calcard::icalendar::{ICalendar, ICalendarProperty, ICalendarStatus};
 use chrono::{DateTime, Duration, LocalResult, NaiveDate, NaiveDateTime, TimeZone, Utc};
 use chrono_tz::Tz;
 use log::{debug, warn};
@@ -37,19 +37,25 @@ pub fn parse_event(ics_data: &str, href: String, etag: Option<String>) -> Result
         .context("No UID found in event")?
         .to_string();
 
-    // Unfold the original ICS data (join RFC 5545 continuation lines) so that
-    // extract_property can scan it directly without a costly re-serialization.
+    // Unfold the original ICS data (join RFC 5545 continuation lines) so the
+    // TZID-aware date and VALARM extractors below can scan it directly.
     let unfolded = unfold_ics(ics_data);
 
-    // Extract summary
+    // Content (non-date) properties come straight from calcard's parsed model,
+    // which has already unfolded lines and unescaped text. Read a single-value
+    // text property off the VEVENT component.
+    let text_prop = |prop: &ICalendarProperty| -> Option<String> {
+        event_component
+            .property(prop)
+            .and_then(|entry| entry.values.first())
+            .and_then(|value| value.as_text())
+            .map(str::to_owned)
+    };
+
     let summary =
-        extract_property(&unfolded, "SUMMARY").unwrap_or_else(|| "(No title)".to_string());
-
-    // Extract description
-    let description = extract_property(&unfolded, "DESCRIPTION");
-
-    // Extract location
-    let location = extract_property(&unfolded, "LOCATION");
+        text_prop(&ICalendarProperty::Summary).unwrap_or_else(|| "(No title)".to_string());
+    let description = text_prop(&ICalendarProperty::Description);
+    let location = text_prop(&ICalendarProperty::Location);
 
     // Extract start time (required). Uses the TZID-aware extractor so
     // `DTSTART;TZID=Asia/Kolkata:20260423T143000` round-trips correctly
@@ -80,14 +86,14 @@ pub fn parse_event(ics_data: &str, href: String, etag: Option<String>) -> Result
     // Calculate duration in minutes
     let duration_minutes = calculate_duration(&start.datetime, &end.datetime).ok();
 
-    // Extract status
-    let status =
-        extract_property(&unfolded, "STATUS").and_then(|s| match s.to_uppercase().as_str() {
-            "CONFIRMED" => Some(EventStatus::Confirmed),
-            "TENTATIVE" => Some(EventStatus::Tentative),
-            "CANCELLED" => Some(EventStatus::Cancelled),
-            _ => None,
-        });
+    // Status via calcard's typed accessor (other statuses map to None, as
+    // before — our model only carries the three VEVENT states).
+    let status = event_component.status().and_then(|s| match s {
+        ICalendarStatus::Confirmed => Some(EventStatus::Confirmed),
+        ICalendarStatus::Tentative => Some(EventStatus::Tentative),
+        ICalendarStatus::Cancelled => Some(EventStatus::Cancelled),
+        _ => None,
+    });
 
     // Extract created/modified timestamps
     // CREATED / LAST-MODIFIED are defined by RFC 5545 to always be UTC
@@ -102,12 +108,21 @@ pub fn parse_event(ics_data: &str, href: String, etag: Option<String>) -> Result
         .and_then(|(dt, _, _)| DateTime::parse_from_rfc3339(&dt).ok())
         .map(|dt| dt.with_timezone(&Utc));
 
-    // Extract organizer
-    let organizer = extract_property(&unfolded, "ORGANIZER")
-        .map(|s| s.strip_prefix("mailto:").unwrap_or(&s).to_string());
+    // Organizer / attendees via calcard (CAL-ADDRESS URIs); strip mailto:.
+    let strip_mailto = |s: &str| s.strip_prefix("mailto:").unwrap_or(s).to_string();
+    let organizer = text_prop(&ICalendarProperty::Organizer).map(|s| strip_mailto(&s));
 
-    // Extract attendees
-    let attendees = extract_attendees(&unfolded);
+    let attendee_list: Vec<Attendee> = event_component
+        .properties(&ICalendarProperty::Attendee)
+        .filter_map(|entry| entry.values.first())
+        .filter_map(|value| value.as_text())
+        .map(|s| Attendee {
+            email: strip_mailto(s),
+            name: None,
+            status: None,
+        })
+        .collect();
+    let attendees = (!attendee_list.is_empty()).then_some(attendee_list);
 
     // Recurrence rule, preserved verbatim. Present on master events of a
     // series; absent on single events and on server-expanded instances.
@@ -653,63 +668,6 @@ fn calculate_duration(start: &str, end: &str) -> Result<i64> {
     Ok(duration.num_minutes())
 }
 
-/// Extract attendees from ICS data, scoped to VEVENT section
-fn extract_attendees(ics_data: &str) -> Option<Vec<Attendee>> {
-    let mut in_vevent = false;
-    let mut depth = 0; // Track nested components within VEVENT
-    let mut attendees = Vec::new();
-
-    for line in ics_data.lines() {
-        let line = line.trim();
-
-        if line == "BEGIN:VEVENT" {
-            in_vevent = true;
-            depth = 0;
-            continue;
-        }
-        if line == "END:VEVENT" {
-            break;
-        }
-
-        // Track nested components like VALARM inside VEVENT
-        if in_vevent && line.starts_with("BEGIN:") {
-            depth += 1;
-            continue;
-        }
-        if in_vevent && line.starts_with("END:") {
-            depth -= 1;
-            continue;
-        }
-
-        if in_vevent && depth == 0 && line.starts_with("ATTENDEE") {
-            if let Some(rest) = line.strip_prefix("ATTENDEE") {
-                if rest.starts_with(':') || rest.starts_with(';') {
-                    if let Some(colon_pos) = line.find(':') {
-                        let value = &line[colon_pos + 1..];
-                        let email = value
-                            .strip_prefix("mailto:")
-                            .unwrap_or(value)
-                            .trim()
-                            .to_string();
-
-                        attendees.push(Attendee {
-                            email,
-                            name: None,
-                            status: None,
-                        });
-                    }
-                }
-            }
-        }
-    }
-
-    if attendees.is_empty() {
-        None
-    } else {
-        Some(attendees)
-    }
-}
-
 /// Unfold RFC 5545 line continuations so property lines are whole.
 ///
 /// RFC 5545 §3.1: a long content line may be split by inserting CRLF immediately
@@ -779,8 +737,11 @@ pub fn build_event(args: &IcsBuildArgs<'_>) -> Result<String> {
         "DTSTAMP:{}",
         chrono::Utc::now().format("%Y%m%dT%H%M%SZ")
     )));
-    ics.push_str(&fold_line(&format!("DTSTART:{}", start)));
-    ics.push_str(&fold_line(&format!("DTEND:{}", end)));
+    // An 8-digit date value (no `T`) is an all-day boundary and must carry
+    // `;VALUE=DATE`; a `…T…Z` value is a timed instant. Detecting from the
+    // value shape keeps callers from threading a separate all-day flag.
+    ics.push_str(&fold_line(&dt_line("DTSTART", start)));
+    ics.push_str(&fold_line(&dt_line("DTEND", end)));
     ics.push_str(&fold_line(&format!("SUMMARY:{}", escape_ics_text(summary))));
 
     if let Some(desc) = description {
@@ -839,6 +800,17 @@ pub fn build_event(args: &IcsBuildArgs<'_>) -> Result<String> {
     ICalendar::parse(&ics).map_err(|e| anyhow::anyhow!("Generated invalid ICS: {:?}", e))?;
 
     Ok(ics)
+}
+
+/// Build a `DTSTART`/`DTEND` content line, tagging date-only values (no `T`,
+/// e.g. `20260625`) with `;VALUE=DATE` for all-day events and leaving timed
+/// `…T…Z` values bare.
+fn dt_line(prop: &str, value: &str) -> String {
+    if value.contains('T') {
+        format!("{prop}:{value}")
+    } else {
+        format!("{prop};VALUE=DATE:{value}")
+    }
 }
 
 /// Fold a content line to comply with RFC 5545 §3.1 (max 75 octets per line).
@@ -951,6 +923,65 @@ mod tests {
     }
 
     #[test]
+    fn build_all_day_event_emits_value_date() {
+        // Date-only ICS values (no `T`) must be tagged `;VALUE=DATE`.
+        let ics = build_event(&IcsBuildArgs {
+            uid: "all-day-build",
+            summary: "Conference",
+            start: "20260625",
+            end: "20260628",
+            description: None,
+            location: None,
+            organizer: None,
+            attendees: None,
+            reminders: &[],
+        })
+        .unwrap();
+        assert!(ics.contains("DTSTART;VALUE=DATE:20260625"), "got: {ics}");
+        assert!(ics.contains("DTEND;VALUE=DATE:20260628"), "got: {ics}");
+    }
+
+    #[test]
+    fn all_day_event_round_trips() {
+        // Build → parse keeps it all-day with the original dates.
+        let ics = build_event(&IcsBuildArgs {
+            uid: "rt-all-day",
+            summary: "Holiday",
+            start: "20260625",
+            end: "20260626",
+            description: None,
+            location: None,
+            organizer: None,
+            attendees: None,
+            reminders: &[],
+        })
+        .unwrap();
+        let ev = parse_event(&ics, "/rt.ics".to_owned(), None).unwrap();
+        assert!(ev.all_day);
+        assert_eq!(ev.start.datetime, "2026-06-25");
+        assert_eq!(ev.end.datetime, "2026-06-26");
+    }
+
+    #[test]
+    fn timed_event_still_emits_bare_dtstart() {
+        // Regression guard: timed values keep the un-parameterized form.
+        let ics = build_event(&IcsBuildArgs {
+            uid: "timed",
+            summary: "Call",
+            start: "20260625T120000Z",
+            end: "20260625T130000Z",
+            description: None,
+            location: None,
+            organizer: None,
+            attendees: None,
+            reminders: &[],
+        })
+        .unwrap();
+        assert!(ics.contains("DTSTART:20260625T120000Z"), "got: {ics}");
+        assert!(!ics.contains("VALUE=DATE"), "got: {ics}");
+    }
+
+    #[test]
     fn test_parse_basic_event() {
         let ics = r#"BEGIN:VCALENDAR
 VERSION:2.0
@@ -967,6 +998,34 @@ END:VCALENDAR"#;
         assert_eq!(event.id, "test-123");
         assert_eq!(event.summary, "Test Event");
         assert!(!event.all_day);
+    }
+
+    #[test]
+    fn parse_event_extracts_content_via_calcard() {
+        // Content properties (summary/location/status/organizer/attendees)
+        // now come from calcard's parsed model; mailto: + ATTENDEE params
+        // must still yield bare emails.
+        let ics = r#"BEGIN:VCALENDAR
+VERSION:2.0
+BEGIN:VEVENT
+UID:meeting-1
+DTSTART:20260501T140000Z
+DTEND:20260501T150000Z
+SUMMARY:Sync
+LOCATION:Room A
+STATUS:CONFIRMED
+ORGANIZER:mailto:boss@example.com
+ATTENDEE;CN=Bob:mailto:bob@example.com
+ATTENDEE:mailto:carol@example.com
+END:VEVENT
+END:VCALENDAR"#;
+        let ev = parse_event(ics, "/m.ics".to_owned(), None).unwrap();
+        assert_eq!(ev.summary, "Sync");
+        assert_eq!(ev.location.as_deref(), Some("Room A"));
+        assert_eq!(ev.status, Some(EventStatus::Confirmed));
+        assert_eq!(ev.organizer.as_deref(), Some("boss@example.com"));
+        let emails: Vec<_> = ev.attendees.unwrap().into_iter().map(|a| a.email).collect();
+        assert_eq!(emails, vec!["bob@example.com", "carol@example.com"]);
     }
 
     #[test]

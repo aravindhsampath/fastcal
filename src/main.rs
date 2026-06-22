@@ -13,6 +13,7 @@ mod config;
 mod formatters;
 mod models;
 mod parsers;
+mod timezone;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -28,9 +29,17 @@ async fn main() -> anyhow::Result<()> {
     // Capture the format before cli is consumed by execute()
     let use_json = matches!(cli.format, Some(OutputFormat::Json));
 
-    // Execute command with a 60-second wall-clock timeout
-    // Prevents hanging indefinitely if the CalDAV server is unresponsive
-    let result = tokio::time::timeout(std::time::Duration::from_secs(60), cli.execute()).await;
+    // Commands that block on interactive stdin (config init, unforced delete)
+    // must not run under the wall-clock timeout, or a slow human at the prompt
+    // gets aborted. Everything else is bounded so an unresponsive server can't
+    // hang forever.
+    let interactive = is_interactive(&cli.command);
+    let fut = cli.execute();
+    let result = if interactive {
+        Ok::<_, tokio::time::error::Elapsed>(fut.await)
+    } else {
+        tokio::time::timeout(std::time::Duration::from_secs(60), fut).await
+    };
 
     match result {
         Ok(Ok(())) => {}
@@ -62,6 +71,20 @@ async fn main() -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+/// Commands that block on interactive stdin and so must run without the
+/// wall-clock timeout (it would abort a slow human mid-prompt).
+fn is_interactive(command: &cli::Commands) -> bool {
+    use cli::{Commands, ConfigCommands, EventCommands};
+    matches!(
+        command,
+        Commands::Config {
+            command: ConfigCommands::Init
+        } | Commands::Events {
+            command: EventCommands::Delete { force: false, .. }
+        }
+    )
 }
 
 /// Classify an anyhow error into a process exit code.

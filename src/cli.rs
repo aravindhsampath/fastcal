@@ -7,7 +7,6 @@ use clap_complete::Shell;
 #[derive(Clone, Copy, ValueEnum)]
 pub enum OutputFormat {
     Json,
-    Ics,
     Text,
 }
 
@@ -39,6 +38,11 @@ pub struct Cli {
     /// Dry-run: parse and validate without sending mutations to the server
     #[arg(long, global = true)]
     pub dry_run: bool,
+
+    /// IANA timezone for interpreting and displaying times this invocation
+    /// (e.g. "America/New_York"). Overrides preferences.default_timezone.
+    #[arg(long, global = true)]
+    pub timezone: Option<String>,
 
     #[command(subcommand)]
     pub command: Commands,
@@ -248,31 +252,47 @@ impl Cli {
             format,
             calendar,
             dry_run,
+            timezone,
             command,
             ..
         } = self;
+
+        // Load config once (best-effort): it feeds both the default output
+        // format and the timezone-resolution precedence. Commands that
+        // require config re-load and surface a proper error themselves.
+        let loaded_config = if let Some(ref path) = config {
+            crate::config::Config::load_from(&std::path::PathBuf::from(path)).ok()
+        } else {
+            crate::config::Config::load().ok()
+        };
+
         // Resolve effective format: CLI flag > config preference > default (text)
         let effective_format = format.unwrap_or_else(|| {
-            let loaded = if let Some(ref path) = config {
-                crate::config::Config::load_from(&std::path::PathBuf::from(path)).ok()
-            } else {
-                crate::config::Config::load().ok()
-            };
-            match loaded
+            match loaded_config
                 .as_ref()
                 .map(|c| c.preferences.output_format.as_str())
             {
                 Some("json") => OutputFormat::Json,
-                Some("ics") => OutputFormat::Ics,
                 _ => OutputFormat::Text,
             }
         });
+
+        // Resolve the one timezone for this invocation (flag > config >
+        // system > UTC). An explicitly-set-but-invalid zone fails fast here.
+        let tz = crate::timezone::resolve(
+            timezone.as_deref(),
+            loaded_config
+                .as_ref()
+                .map(|c| c.preferences.default_timezone.as_str()),
+        )?;
 
         let ctx = crate::commands::context::CommandContext::new(
             config,
             effective_format,
             calendar,
             dry_run,
+            tz,
+            loaded_config,
         );
 
         match command {
@@ -299,17 +319,22 @@ impl Cli {
 
                 match command {
                     EventCommands::List { from, to } => {
-                        // Parse dates - error on invalid input instead of silently ignoring
-                        let from_dt = from
-                            .as_ref()
-                            .map(|s| crate::parsers::datetime::parse_datetime(s))
-                            .transpose()?;
-                        let to_dt = to
-                            .as_ref()
-                            .map(|s| crate::parsers::datetime::parse_datetime(s))
-                            .transpose()?;
+                        // Parse dates in the resolved zone; error on invalid input.
+                        // Defaults: from = today, to = from + 30 days. `--to` is
+                        // the exclusive end of a half-open range, so a date-only
+                        // value covers through the end of that local day. Always
+                        // bounding the window also routes through the recurrence
+                        // <expand> path instead of returning unexpanded masters.
+                        let from_dt = match from.as_ref() {
+                            Some(s) => crate::parsers::datetime::parse_datetime(s, tz)?,
+                            None => crate::parsers::datetime::parse_datetime("today", tz)?,
+                        };
+                        let to_dt = match to.as_ref() {
+                            Some(s) => crate::parsers::datetime::parse_range_end(s, tz)?,
+                            None => from_dt + chrono::Duration::days(30),
+                        };
 
-                        events::list(&ctx, from_dt, to_dt).await
+                        events::list(&ctx, Some(from_dt), Some(to_dt)).await
                     }
                     EventCommands::Get { event_id } => events::get(&ctx, event_id).await,
                     EventCommands::Create {
@@ -370,14 +395,15 @@ impl Cli {
                         events::delete(&ctx, event_id, force).await
                     }
                     EventCommands::Search { query, from, to } => {
-                        // Parse dates - error on invalid input
+                        // Parse dates in the resolved zone; `--to` is the
+                        // exclusive end of a half-open range.
                         let from_dt = from
                             .as_ref()
-                            .map(|s| crate::parsers::datetime::parse_datetime(s))
+                            .map(|s| crate::parsers::datetime::parse_datetime(s, tz))
                             .transpose()?;
                         let to_dt = to
                             .as_ref()
-                            .map(|s| crate::parsers::datetime::parse_datetime(s))
+                            .map(|s| crate::parsers::datetime::parse_range_end(s, tz))
                             .transpose()?;
 
                         events::search(&ctx, query, from_dt, to_dt).await

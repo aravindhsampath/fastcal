@@ -83,8 +83,21 @@ pub fn parse_event(ics_data: &str, href: String, etag: Option<String>) -> Result
         default_end_time(&start_dt, &start_tz)?
     };
 
-    // Calculate duration in minutes
-    let duration_minutes = calculate_duration(&start.datetime, &end.datetime).ok();
+    // For all-day events, present the RFC 5545 *exclusive* DTEND as the
+    // inclusive last day — matching fastcal's inclusive `--end` input, so a
+    // create/read round-trips to the same dates — and carry no minute
+    // duration. Timed events keep the computed minutes.
+    let (end, duration_minutes) = if all_day {
+        let inclusive = NaiveDate::parse_from_str(&end.datetime, "%Y-%m-%d")
+            .ok()
+            .and_then(|d| d.pred_opt())
+            .map(|d| d.format("%Y-%m-%d").to_string());
+        let end_str = inclusive.unwrap_or(end.datetime);
+        (EventDateTime::new(end_str, None), None)
+    } else {
+        let dm = calculate_duration(&start.datetime, &end.datetime).ok();
+        (end, dm)
+    };
 
     // Status via calcard's typed accessor (other statuses map to None, as
     // before — our model only carries the three VEVENT states).
@@ -959,7 +972,9 @@ mod tests {
         let ev = parse_event(&ics, "/rt.ics".to_owned(), None).unwrap();
         assert!(ev.all_day);
         assert_eq!(ev.start.datetime, "2026-06-25");
-        assert_eq!(ev.end.datetime, "2026-06-26");
+        // DTEND 20260626 is exclusive → inclusive last day is 06-25 (single day).
+        assert_eq!(ev.end.datetime, "2026-06-25");
+        assert_eq!(ev.duration_minutes, None);
     }
 
     #[test]

@@ -54,34 +54,49 @@ pub fn classify(input: &str, tz: Tz) -> Result<TimeSpec> {
         return Ok(TimeSpec::Instant(dt.with_timezone(&Utc)));
     }
 
-    // Date only (YYYY-MM-DD).
-    if input.len() == 10 && input.as_bytes()[4] == b'-' {
-        let date = NaiveDate::parse_from_str(input, "%Y-%m-%d")
-            .with_context(|| format!("Failed to parse date: '{input}'"))?;
-        return Ok(TimeSpec::Date(date));
-    }
-
-    // Naive datetimes — interpreted in `tz`.
-    if let Ok(ndt) = NaiveDateTime::parse_from_str(input, "%Y-%m-%d %H:%M") {
-        return Ok(TimeSpec::Instant(local_to_utc(ndt, tz)?));
-    }
-    if let Ok(ndt) = NaiveDateTime::parse_from_str(input, "%Y-%m-%d %H:%M:%S") {
-        return Ok(TimeSpec::Instant(local_to_utc(ndt, tz)?));
-    }
-
-    // Natural formats like "2026-03-05 2pm", "2026-03-05 2:30pm", "… 14:30".
-    if let Some((date_part, time_part)) = input.split_once(' ') {
-        if let Ok(date) = NaiveDate::parse_from_str(date_part, "%Y-%m-%d") {
-            if let Some(ndt) = parse_natural_time(date, time_part) {
-                return Ok(TimeSpec::Instant(local_to_utc(ndt, tz)?));
-            }
+    // A `YYYY-MM-DD` prefix. We validate the date deterministically so a
+    // well-formed-but-impossible date ("2026-02-31") gets a precise error
+    // here instead of a generic one (or a confusing server rejection later).
+    // The char-boundary guard keeps a multibyte input from ever panicking.
+    if input.len() >= 10 && input.is_char_boundary(10) && looks_like_date_prefix(&input[..10]) {
+        let date = NaiveDate::parse_from_str(&input[..10], "%Y-%m-%d").map_err(|_| {
+            anyhow::anyhow!(
+                "invalid date '{}': that calendar date does not exist",
+                &input[..10]
+            )
+        })?;
+        if input.len() == 10 {
+            return Ok(TimeSpec::Date(date));
         }
+        // A time-of-day follows the date — the date is known good, so any
+        // failure here is specifically a bad *time*.
+        let rest = input[10..].trim_start();
+        if let Some(naive) = parse_natural_time(date, rest) {
+            return Ok(TimeSpec::Instant(local_to_utc(naive, tz)?));
+        }
+        anyhow::bail!(
+            "invalid time '{rest}' for {date}: try HH:MM (14:30), 2:30pm, noon, \
+             'half past 2', or 'quarter to 9'"
+        );
     }
 
     anyhow::bail!(
         "Unsupported datetime format: '{input}'. Try ISO 8601 (2026-03-05T14:30:00Z), \
-         YYYY-MM-DD, or YYYY-MM-DD HH:MM"
+         YYYY-MM-DD, or 'YYYY-MM-DD HH:MM'"
     )
+}
+
+/// True if `s` has exactly the 10-byte shape `YYYY-MM-DD` (digits + dashes).
+fn looks_like_date_prefix(s: &str) -> bool {
+    let b = s.as_bytes();
+    b.len() == 10
+        && b[..4].iter().all(u8::is_ascii_digit)
+        && b[4] == b'-'
+        && b[5].is_ascii_digit()
+        && b[6].is_ascii_digit()
+        && b[7] == b'-'
+        && b[8].is_ascii_digit()
+        && b[9].is_ascii_digit()
 }
 
 /// Parse a datetime as a single instant in zone `tz`.
@@ -137,50 +152,103 @@ fn midnight(date: NaiveDate) -> NaiveDateTime {
         .expect("00:00:00 is always a valid time")
 }
 
-/// Parse natural time formats like "2pm", "2:30pm", "14:30" into a naive
-/// datetime on `date`. Zone application happens in the caller.
+/// Parse a time-of-day on `date`. Zone application happens in the caller.
+///
+/// Supported (all optionally with an `am`/`pm` suffix on the hour):
+/// - `noon` / `midday` → 12:00, `midnight` → 00:00
+/// - `14:30`, `2:30pm`, `9:30:00`
+/// - `2pm`, bare hour `17` → 17:00 (a bare hour is read as 24-hour)
+/// - `half past 6` → 6:30, `quarter past 9` → 9:15, `quarter to 9` → 8:45
+/// - `5 minutes to 9` / `5 to 9` → 8:55, `10 minutes past 9` → 9:10
+///
+/// A bare `half 9` is intentionally NOT accepted: it's 9:30 in English but
+/// 8:30 in Dutch/German, so we require the unambiguous `half past`.
 fn parse_natural_time(date: NaiveDate, time_str: &str) -> Option<NaiveDateTime> {
-    let time_str = time_str.trim().to_lowercase();
+    let s = time_str.trim().to_lowercase();
+    if s.is_empty() {
+        return None;
+    }
 
-    // Handle "2pm", "2:30pm" format
-    if time_str.ends_with("pm") || time_str.ends_with("am") {
-        let is_pm = time_str.ends_with("pm");
-        let time_part = time_str
-            .trim_end_matches("pm")
-            .trim_end_matches("am")
-            .trim();
+    // Word anchors.
+    match s.as_str() {
+        "noon" | "midday" => return date.and_hms_opt(12, 0, 0),
+        "midnight" => return date.and_hms_opt(0, 0, 0),
+        _ => {}
+    }
 
-        if let Some((hour_str, min_str)) = time_part.split_once(':') {
-            // "2:30pm" format
-            if let (Ok(mut hour), Ok(min)) = (hour_str.parse::<u32>(), min_str.parse::<u32>()) {
-                if is_pm && hour != 12 {
-                    hour += 12;
-                } else if !is_pm && hour == 12 {
-                    hour = 0;
+    // Pull off an am/pm suffix; it applies to whatever hour we resolve.
+    let (body, ampm) = strip_ampm(&s);
+
+    // "<minutes> past <hour>" / "<minutes> to <hour>" (quarter / half / number).
+    for (sep, is_to) in [(" past ", false), (" to ", true)] {
+        if let Some((mpart, hpart)) = body.split_once(sep) {
+            let min = parse_minute_word(mpart)?;
+            let hour = apply_ampm(hpart.trim().parse::<u32>().ok()?, ampm);
+            return if is_to {
+                if min > 60 || hour == 0 {
+                    return None; // would cross the day boundary — leave to the caller
                 }
-                return date.and_hms_opt(hour, min, 0);
-            }
-        } else {
-            // "2pm" format
-            if let Ok(mut hour) = time_part.parse::<u32>() {
-                if is_pm && hour != 12 {
-                    hour += 12;
-                } else if !is_pm && hour == 12 {
-                    hour = 0;
-                }
-                return date.and_hms_opt(hour, 0, 0);
-            }
+                date.and_hms_opt(hour - 1, 60 - min, 0)
+            } else {
+                date.and_hms_opt(hour, min, 0)
+            };
         }
     }
 
-    // Handle "14:30" format (24-hour)
-    if let Some((hour_str, min_str)) = time_str.split_once(':') {
-        if let (Ok(hour), Ok(min)) = (hour_str.parse::<u32>(), min_str.parse::<u32>()) {
-            return date.and_hms_opt(hour, min, 0);
-        }
+    // "H:MM" or "H:MM:SS".
+    let parts: Vec<&str> = body.split(':').collect();
+    if parts.len() == 2 || parts.len() == 3 {
+        let h = apply_ampm(parts[0].trim().parse::<u32>().ok()?, ampm);
+        let m = parts[1].trim().parse::<u32>().ok()?;
+        let sec = if parts.len() == 3 {
+            parts[2].trim().parse::<u32>().ok()?
+        } else {
+            0
+        };
+        return date.and_hms_opt(h, m, sec);
+    }
+
+    // Bare hour ("17" → 17:00; "5pm" → 17:00).
+    if let Ok(h) = body.trim().parse::<u32>() {
+        return date.and_hms_opt(apply_ampm(h, ampm), 0, 0);
     }
 
     None
+}
+
+/// Split a trailing `am`/`pm` (or `a.m.`/`p.m.`) off `s`. Returns the
+/// remainder and `Some(true)` for pm, `Some(false)` for am, `None` if absent.
+fn strip_ampm(s: &str) -> (String, Option<bool>) {
+    let s = s.trim();
+    for (suffix, is_pm) in [("p.m.", true), ("pm", true), ("a.m.", false), ("am", false)] {
+        if let Some(rest) = s.strip_suffix(suffix) {
+            return (rest.trim().to_string(), Some(is_pm));
+        }
+    }
+    (s.to_string(), None)
+}
+
+/// Apply an am/pm flag to a 12-hour `hour`. With no flag the hour is taken
+/// as-is (24-hour).
+fn apply_ampm(hour: u32, ampm: Option<bool>) -> u32 {
+    match ampm {
+        Some(true) if hour != 12 => hour + 12, // pm
+        Some(false) if hour == 12 => 0,        // 12am → 00
+        _ => hour,
+    }
+}
+
+/// Parse the minutes part of a "past/to" phrase: `quarter`→15, `half`→30,
+/// or leading digits (`5`, `5 minutes`, `20 mins`).
+fn parse_minute_word(w: &str) -> Option<u32> {
+    match w.trim() {
+        "quarter" => Some(15),
+        "half" => Some(30),
+        other => {
+            let digits: String = other.chars().take_while(|c| c.is_ascii_digit()).collect();
+            digits.parse::<u32>().ok().filter(|&n| n <= 59)
+        }
+    }
 }
 
 /// Format a UTC instant for iCalendar (`YYYYMMDDTHHMMSSZ`).
@@ -262,6 +330,85 @@ mod tests {
     fn test_format_date_for_ics() {
         let d = NaiveDate::from_ymd_opt(2026, 6, 25).unwrap();
         assert_eq!(format_date_for_ics(&d), "20260625");
+    }
+
+    // ── Natural-language times (L2) ───────────────────────────────────────
+
+    fn hm(input: &str) -> (u32, u32) {
+        // Parse on a fixed UTC day and read back the wall-clock h:m.
+        let dt = parse_datetime(&format!("2026-06-25 {input}"), UTC).unwrap();
+        (dt.hour(), dt.minute())
+    }
+
+    #[test]
+    fn natural_noon_and_midnight() {
+        assert_eq!(hm("noon"), (12, 0));
+        assert_eq!(hm("midday"), (12, 0));
+        assert_eq!(hm("midnight"), (0, 0));
+    }
+
+    #[test]
+    fn natural_half_and_quarter() {
+        assert_eq!(hm("half past 6"), (6, 30));
+        assert_eq!(hm("quarter past 9"), (9, 15));
+        assert_eq!(hm("quarter to 9"), (8, 45));
+        assert_eq!(hm("half past 6 pm"), (18, 30));
+        assert_eq!(hm("quarter to 9 pm"), (20, 45));
+    }
+
+    #[test]
+    fn natural_minutes_to_and_past() {
+        assert_eq!(hm("5 minutes to 9"), (8, 55));
+        assert_eq!(hm("5 to 9"), (8, 55));
+        assert_eq!(hm("10 minutes past 9"), (9, 10));
+        assert_eq!(hm("20 mins past 7"), (7, 20));
+    }
+
+    #[test]
+    fn bare_hour_is_24h() {
+        assert_eq!(hm("17"), (17, 0));
+        assert_eq!(hm("12"), (12, 0)); // "lunch at 12" → noon, not midnight
+        assert_eq!(hm("9"), (9, 0));
+        assert_eq!(hm("9pm"), (21, 0));
+    }
+
+    #[test]
+    fn natural_seconds_and_existing_forms_still_work() {
+        assert_eq!(hm("14:30"), (14, 30));
+        assert_eq!(hm("2:30pm"), (14, 30));
+        assert_eq!(hm("9:05:30"), (9, 5));
+    }
+
+    #[test]
+    fn half_bare_is_rejected_to_avoid_dutch_ambiguity() {
+        // "half 9" must NOT silently become 09:30 (English) or 08:30 (Dutch).
+        assert!(parse_datetime("2026-06-25 half 9", UTC).is_err());
+    }
+
+    // ── Deterministic invalid date/time errors (M2) ───────────────────────
+
+    #[test]
+    fn invalid_calendar_date_is_caught_with_clear_message() {
+        let err = parse_datetime("2026-02-31 10:00", UTC)
+            .unwrap_err()
+            .to_string();
+        assert!(err.to_lowercase().contains("invalid date"), "got: {err}");
+    }
+
+    #[test]
+    fn invalid_time_on_valid_date_is_distinguished() {
+        let err = parse_datetime("2026-06-25 25:00", UTC)
+            .unwrap_err()
+            .to_string();
+        assert!(err.to_lowercase().contains("invalid time"), "got: {err}");
+    }
+
+    #[test]
+    fn non_date_input_still_generic_error() {
+        let err = parse_datetime("next thursday-ish", UTC)
+            .unwrap_err()
+            .to_string();
+        assert!(err.to_lowercase().contains("unsupported"), "got: {err}");
     }
 
     // ── Zone-aware naive interpretation ───────────────────────────────────

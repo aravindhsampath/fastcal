@@ -148,7 +148,8 @@ pub struct EventCreateOverrides {
     pub location: Option<String>,
     pub description: Option<String>,
     pub attendees: Option<String>,
-    pub reminder_minutes: Option<u32>,
+    /// Zero or more DISPLAY reminders (minutes before start). Empty ⇒ none.
+    pub reminder_minutes: Vec<u32>,
 }
 
 /// Execute events create command
@@ -190,7 +191,12 @@ pub async fn create(
                 location.or(json_event.location),
                 description.or(json_event.description),
                 attendees.or(json_event.attendees),
-                reminder_minutes.or(json_event.reminder_minutes),
+                // CLI reminders win when given; otherwise take the file's.
+                if reminder_minutes.is_empty() {
+                    json_event.reminder_minutes
+                } else {
+                    reminder_minutes
+                },
             )
         } else {
             let summary = summary
@@ -290,7 +296,7 @@ pub async fn create(
                 if let Some(ref att) = event_input.attendees {
                     println!("  Attendees:{}", att);
                 }
-                if let Some(mins) = event_input.reminder_minutes {
+                for mins in &event_input.reminder_minutes {
                     println!("  Reminder: {} minutes before", mins);
                 }
             }
@@ -298,9 +304,15 @@ pub async fn create(
                 // Mirror the `Reminder` shape that parse→serialize would
                 // produce, so a dry-run preview and a real create emit the
                 // same field names downstream.
-                let reminders_json = event_input
-                    .reminder_minutes
-                    .map(|m| json!([{ "minutes_before": m, "action": "display" }]));
+                let reminders_json = if event_input.reminder_minutes.is_empty() {
+                    json!(null)
+                } else {
+                    json!(event_input
+                        .reminder_minutes
+                        .iter()
+                        .map(|m| json!({ "minutes_before": m, "action": "display" }))
+                        .collect::<Vec<_>>())
+                };
                 // Preview reflects intent in the resolved zone: localized
                 // instants for timed events, inclusive local dates for all-day.
                 let (start_json, end_json, duration_json) = if times.all_day {
@@ -508,10 +520,10 @@ pub struct EventUpdatePatch {
     pub location: Option<String>,
     pub description: Option<String>,
     pub attendees: Option<String>,
-    /// When `Some(n)`, replace all existing VALARMs with a single
-    /// DISPLAY reminder `n` minutes before start. When `None`, leave
-    /// the existing reminders untouched (unless `no_reminders` is set).
-    pub reminder_minutes: Option<u32>,
+    /// When non-empty, replace all existing VALARMs with one DISPLAY reminder
+    /// per entry (minutes before start). When empty, leave the existing
+    /// reminders untouched (unless `no_reminders` is set).
+    pub reminder_minutes: Vec<u32>,
     /// When `true`, strip every VALARM from the event on PUT. Mutually
     /// exclusive with `reminder_minutes` at the CLI layer; we don't
     /// re-enforce here so internal callers can opt for "clear" cleanly.
@@ -568,51 +580,54 @@ pub async fn update(
 
     // Resolve new start/end honoring the resolved zone and all-day events.
     // Each side comes from the explicit patch (classified in `tz`) or is
-    // carried over from the stored event. A date-only value keeps/makes the
-    // event all-day; mixing a date and a time across start/end is rejected.
-    // `start_ics`/`end_ics` are the ICS wire values (date or `…Z`).
+    // carried over from the stored event. When only the start moves, the end
+    // shifts by the same delta so the event's duration/span is preserved
+    // (moving "to 2 PM" keeps a 45-minute meeting 45 minutes). A date-only
+    // value keeps/makes the event all-day; mixing a date and a time is rejected.
     use crate::parsers::datetime::{classify, format_date_for_ics, format_for_ics, TimeSpec};
 
-    let end_provided = end.is_some();
-    let start_spec = match &start {
+    let start_changed = start.is_some();
+    let end_changed = end.is_some();
+    let existing_start = existing_time_spec(&event.start, event.all_day)
+        .context("Failed to parse existing start time")?;
+    let existing_end = existing_time_spec(&event.end, event.all_day)
+        .context("Failed to parse existing end time")?;
+
+    let new_start = match &start {
         Some(s) => {
             classify(s, ctx.timezone).with_context(|| format!("Failed to parse start time: {s}"))?
         }
-        None => existing_time_spec(&event.start, event.all_day)
-            .context("Failed to parse existing start time")?,
+        None => existing_start,
     };
-    let end_spec = match &end {
+    let new_end = match &end {
         Some(e) => {
             classify(e, ctx.timezone).with_context(|| format!("Failed to parse end time: {e}"))?
         }
-        None => existing_time_spec(&event.end, event.all_day)
-            .context("Failed to parse existing end time")?,
+        None if start_changed => shift_end(existing_start, existing_end, new_start),
+        None => existing_end,
     };
-    if start.is_some() || end_provided {
+    if start_changed || end_changed {
         changed = true;
     }
 
-    let (start_ics, end_ics) = match (start_spec, end_spec) {
-        (TimeSpec::Date(start_date), TimeSpec::Date(end_date)) => {
-            // All-day. A user-supplied end is an inclusive last day; an end
-            // carried over from the stored event is already the exclusive
-            // RFC 5545 DTEND.
-            let end_exclusive = if end_provided {
-                end_date.succ_opt().context("end date is out of range")?
-            } else {
-                end_date
-            };
-            if end_exclusive <= start_date {
+    let (start_ics, end_ics) = match (new_start, new_end) {
+        (TimeSpec::Date(start_date), TimeSpec::Date(end_inclusive)) => {
+            // Both ends are inclusive (fastcal's human-facing convention);
+            // the RFC 5545 DTEND on the wire is the day after.
+            if end_inclusive < start_date {
                 anyhow::bail!("end date must be on or after start date");
             }
+            let end_exclusive = end_inclusive
+                .succ_opt()
+                .context("end date is out of range")?;
             event.all_day = true;
             event.start =
                 crate::models::EventDateTime::new(start_date.format("%Y-%m-%d").to_string(), None);
             event.end = crate::models::EventDateTime::new(
-                end_exclusive.format("%Y-%m-%d").to_string(),
+                end_inclusive.format("%Y-%m-%d").to_string(),
                 None,
             );
-            event.duration_minutes = Some((end_exclusive - start_date).num_days() * 1440);
+            event.duration_minutes = None;
             (
                 format_date_for_ics(&start_date),
                 format_date_for_ics(&end_exclusive),
@@ -680,17 +695,19 @@ pub async fn update(
     }
 
     // Reminder changes are applied after content fields so they don't
-    // interact with the "was anything changed?" guard below. Update
-    // semantics (from VALARM_PLAN.md §4):
-    //   - `reminder_minutes = Some(n)` → replace all VALARMs with one
-    //   - `no_reminders = true`         → strip all VALARMs
-    //   - neither                       → leave event.reminders alone
-    if let Some(mins) = reminder_minutes {
-        event.reminders = vec![crate::models::Reminder {
-            minutes_before: mins,
-            action: "display".to_owned(),
-            description: None,
-        }];
+    // interact with the "was anything changed?" guard below. Update semantics:
+    //   - one or more `--reminder-minutes` → replace all VALARMs with those
+    //   - `no_reminders = true`            → strip all VALARMs
+    //   - neither                          → leave event.reminders alone
+    if !reminder_minutes.is_empty() {
+        event.reminders = reminder_minutes
+            .iter()
+            .map(|&mins| crate::models::Reminder {
+                minutes_before: mins,
+                action: "display".to_owned(),
+                description: None,
+            })
+            .collect();
         changed = true;
     } else if no_reminders && !event.reminders.is_empty() {
         event.reminders.clear();
@@ -792,6 +809,27 @@ fn existing_time_spec(
         edt.as_utc()
             .map(TimeSpec::Instant)
             .with_context(|| format!("invalid stored datetime '{}'", edt.datetime))
+    }
+}
+
+/// Shift `existing_end` by the same delta as `existing_start → new_start`, so a
+/// start-only reschedule preserves the event's duration (timed) or span
+/// (all-day). If the start's kind changed (date↔time), the original end is
+/// returned and the caller's all-day/timed check reports the mismatch.
+fn shift_end(
+    existing_start: crate::parsers::datetime::TimeSpec,
+    existing_end: crate::parsers::datetime::TimeSpec,
+    new_start: crate::parsers::datetime::TimeSpec,
+) -> crate::parsers::datetime::TimeSpec {
+    use crate::parsers::datetime::TimeSpec;
+    match (existing_start, existing_end, new_start) {
+        (TimeSpec::Instant(os), TimeSpec::Instant(oe), TimeSpec::Instant(ns)) => {
+            TimeSpec::Instant(oe + (ns - os))
+        }
+        (TimeSpec::Date(os), TimeSpec::Date(oe), TimeSpec::Date(ns)) => {
+            TimeSpec::Date(oe + chrono::Duration::days((ns - os).num_days()))
+        }
+        (_, existing_end, _) => existing_end,
     }
 }
 
@@ -1016,6 +1054,46 @@ mod tests {
 
     fn dt(h: u32, m: u32) -> chrono::DateTime<Utc> {
         Utc.with_ymd_and_hms(2026, 3, 10, h, m, 0).unwrap()
+    }
+
+    // ── B1: start-only reschedule preserves duration/span ─────────────────
+
+    #[test]
+    fn shift_end_preserves_timed_duration_when_moved_later() {
+        use crate::parsers::datetime::TimeSpec;
+        // 10:00–10:45 moved to start 14:00 → end 14:45 (45 min preserved).
+        let out = shift_end(
+            TimeSpec::Instant(dt(10, 0)),
+            TimeSpec::Instant(dt(10, 45)),
+            TimeSpec::Instant(dt(14, 0)),
+        );
+        assert_eq!(out, TimeSpec::Instant(dt(14, 45)));
+    }
+
+    #[test]
+    fn shift_end_preserves_timed_duration_when_moved_earlier() {
+        use crate::parsers::datetime::TimeSpec;
+        // 10:00–11:00 moved to start 09:00 → end 10:00 (60 min preserved).
+        let out = shift_end(
+            TimeSpec::Instant(dt(10, 0)),
+            TimeSpec::Instant(dt(11, 0)),
+            TimeSpec::Instant(dt(9, 0)),
+        );
+        assert_eq!(out, TimeSpec::Instant(dt(10, 0)));
+    }
+
+    #[test]
+    fn shift_end_preserves_allday_span() {
+        use crate::parsers::datetime::TimeSpec;
+        use chrono::NaiveDate;
+        let d = |m, day| NaiveDate::from_ymd_opt(2026, m, day).unwrap();
+        // 06-25..06-26 (2 days) moved to start 07-01 → end 07-02 (still 2 days).
+        let out = shift_end(
+            TimeSpec::Date(d(6, 25)),
+            TimeSpec::Date(d(6, 26)),
+            TimeSpec::Date(d(7, 1)),
+        );
+        assert_eq!(out, TimeSpec::Date(d(7, 2)));
     }
 
     #[test]

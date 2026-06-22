@@ -24,14 +24,13 @@ fn fmt_local(datetime: &str, tz: Tz, fmt: &str) -> String {
     }
 }
 
-/// Render an all-day event's date span (date-only, no zone). The stored
-/// `end` is the RFC 5545 exclusive end, so the inclusive last day is `end-1`.
+/// Render an all-day event's date span (date-only, no zone). `start` and
+/// `end` are both inclusive (fastcal's human-facing convention).
 fn format_all_day(event: &Event) -> String {
     let start = NaiveDate::parse_from_str(&event.start.datetime, "%Y-%m-%d").ok();
-    let end_excl = NaiveDate::parse_from_str(&event.end.datetime, "%Y-%m-%d").ok();
-    match (start, end_excl) {
-        (Some(s), Some(e)) => {
-            let last = e.pred_opt().unwrap_or(s);
+    let last = NaiveDate::parse_from_str(&event.end.datetime, "%Y-%m-%d").ok();
+    match (start, last) {
+        (Some(s), Some(last)) => {
             if last <= s {
                 format!("{} (all-day)", s.format("%a %b %d, %Y"))
             } else {
@@ -275,9 +274,9 @@ mod tests {
     fn all_day_event() -> Event {
         Event {
             all_day: true,
-            // exclusive end == start + 1 → single day
+            // inclusive start == end → single day (06-25)
             start: EventDateTime::new("2026-06-25".into(), None),
-            end: EventDateTime::new("2026-06-26".into(), None),
+            end: EventDateTime::new("2026-06-25".into(), None),
             duration_minutes: None,
             ..timed_event()
         }

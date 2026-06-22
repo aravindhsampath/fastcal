@@ -294,6 +294,7 @@ impl Cli {
             calendar,
             dry_run,
             tz,
+            loaded_config,
         );
 
         match command {

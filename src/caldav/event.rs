@@ -152,11 +152,12 @@ pub async fn list_events(
     Ok(events)
 }
 
-/// Find an event by ID across all calendars
+/// Find an event by ID across all calendars.
 ///
-/// Fast path: tries `{calendar_href}/{event_id}.ics` directly (O(N) where N=calendars).
-/// Fastmail and most CalDAV servers use the UID as the resource filename.
-/// Falls back to a full scan only if the fast path misses everywhere.
+/// Fast path: tries `{calendar_href}/{event_id}.ics` directly in **all
+/// calendars concurrently** (Fastmail and most CalDAV servers name the
+/// resource after the UID). Falls back to a concurrent full scan only if the
+/// fast path misses everywhere.
 pub async fn find_event_by_id(
     client: &Client,
     event_id: &str,
@@ -164,84 +165,120 @@ pub async fn find_event_by_id(
 ) -> Result<Option<(String, Event)>> {
     log::info!("Searching for event with UID: {}", event_id);
 
-    // Fast path: try direct fetch by convention (uid.ics)
-    for (calendar_name, calendar_href) in calendars {
-        let event_href = format!("{}/{}.ics", calendar_href.trim_end_matches('/'), event_id);
-        log::debug!("Fast-path fetch: {}", event_href);
-
-        let resources = match client
-            .request(GetCalendarResources::new(calendar_href).with_hrefs(vec![event_href]))
-            .await
-        {
-            Ok(r) => r,
-            Err(_) => continue,
-        };
-
-        for resource in resources.resources {
-            if let Ok(fetched) = resource.content {
-                if let Ok(mut event) =
-                    ics::parse_event(&fetched.data, resource.href, Some(fetched.etag))
-                {
-                    if event.id == event_id {
-                        event.calendar = Some(calendar_name.clone());
-                        log::debug!("Found via fast path in calendar: {}", calendar_name);
-                        return Ok(Some((calendar_name.clone(), event)));
-                    }
-                }
-            }
-        }
+    // Fast path: direct uid.ics fetch in every calendar at once.
+    let fast = futures_util::future::join_all(
+        calendars
+            .iter()
+            .map(|(name, href)| fetch_event_by_convention(client, name, href, event_id)),
+    )
+    .await;
+    if let Some(found) = fast.into_iter().flatten().next() {
+        return Ok(Some(found));
     }
 
-    // Slow path: full scan (for non-standard filename conventions)
+    // Slow path: concurrent full scan (for non-standard filename conventions).
     log::debug!("Fast path missed; falling back to full scan");
-    for (calendar_name, calendar_href) in calendars {
-        let list_result = ListCalendarResources::new(calendar_href)
-            .with_component("VEVENT")
-            .context("Failed to create component filter")?;
+    let scanned = futures_util::future::join_all(
+        calendars
+            .iter()
+            .map(|(name, href)| scan_calendar_for_event(client, name, href, event_id)),
+    )
+    .await;
+    Ok(scanned.into_iter().flatten().next())
+}
 
-        let listed = match client.request(list_result).await {
-            Ok(l) => l,
-            Err(e) => {
-                log::warn!("Failed to list events in calendar {}: {}", calendar_name, e);
-                continue;
-            }
-        };
+/// Find an event by ID within a single calendar: fast `uid.ics` fetch, then a
+/// scoped full scan. Used when the caller already knows the target calendar
+/// (e.g. `--calendar`), avoiding a whole-calendar download.
+pub async fn find_event_in_calendar(
+    client: &Client,
+    calendar_name: &str,
+    calendar_href: &str,
+    event_id: &str,
+) -> Result<Option<(String, Event)>> {
+    if let Some(found) =
+        fetch_event_by_convention(client, calendar_name, calendar_href, event_id).await
+    {
+        return Ok(Some(found));
+    }
+    Ok(scan_calendar_for_event(client, calendar_name, calendar_href, event_id).await)
+}
 
-        let hrefs: Vec<String> = listed.resources.into_iter().map(|r| r.href).collect();
-        if hrefs.is_empty() {
-            continue;
+/// Try the direct `{href}/{uid}.ics` fetch for one calendar. `None` on any
+/// network/parse miss — callers fall back to a scan.
+async fn fetch_event_by_convention(
+    client: &Client,
+    calendar_name: &str,
+    calendar_href: &str,
+    event_id: &str,
+) -> Option<(String, Event)> {
+    let event_href = format!("{}/{}.ics", calendar_href.trim_end_matches('/'), event_id);
+    log::debug!("Fast-path fetch: {}", event_href);
+
+    let resources = client
+        .request(GetCalendarResources::new(calendar_href).with_hrefs(vec![event_href]))
+        .await
+        .ok()?;
+
+    find_matching_event(resources.resources, calendar_name, event_id)
+}
+
+/// Full scan of one calendar: list every VEVENT, multi-get, find by UID.
+async fn scan_calendar_for_event(
+    client: &Client,
+    calendar_name: &str,
+    calendar_href: &str,
+    event_id: &str,
+) -> Option<(String, Event)> {
+    let list_request = ListCalendarResources::new(calendar_href)
+        .with_component("VEVENT")
+        .ok()?;
+    let listed = match client.request(list_request).await {
+        Ok(l) => l,
+        Err(e) => {
+            log::warn!("Failed to list events in calendar {}: {}", calendar_name, e);
+            return None;
         }
+    };
 
-        let resources = match client
-            .request(GetCalendarResources::new(calendar_href).with_hrefs(hrefs))
-            .await
-        {
-            Ok(r) => r,
-            Err(e) => {
-                log::warn!(
-                    "Failed to fetch events in calendar {}: {}",
-                    calendar_name,
-                    e
-                );
-                continue;
-            }
-        };
+    let hrefs: Vec<String> = listed.resources.into_iter().map(|r| r.href).collect();
+    if hrefs.is_empty() {
+        return None;
+    }
 
-        for resource in resources.resources {
-            if let Ok(fetched) = resource.content {
-                if let Ok(mut event) =
-                    ics::parse_event(&fetched.data, resource.href, Some(fetched.etag))
-                {
-                    if event.id == event_id {
-                        event.calendar = Some(calendar_name.clone());
-                        return Ok(Some((calendar_name.clone(), event)));
-                    }
+    let resources = match client
+        .request(GetCalendarResources::new(calendar_href).with_hrefs(hrefs))
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            log::warn!("Failed to fetch events in calendar {}: {}", calendar_name, e);
+            return None;
+        }
+    };
+
+    find_matching_event(resources.resources, calendar_name, event_id)
+}
+
+/// Scan fetched resources for the one whose parsed UID matches `event_id`,
+/// stamping the owning calendar name.
+fn find_matching_event(
+    resources: Vec<libdav::FetchedResource>,
+    calendar_name: &str,
+    event_id: &str,
+) -> Option<(String, Event)> {
+    for resource in resources {
+        if let Ok(fetched) = resource.content {
+            if let Ok(mut event) = ics::parse_event(&fetched.data, resource.href, Some(fetched.etag))
+            {
+                if event.id == event_id {
+                    event.calendar = Some(calendar_name.to_string());
+                    return Some((calendar_name.to_string(), event));
                 }
             }
         }
     }
-
-    Ok(None)
+    None
 }
 
 #[cfg(test)]

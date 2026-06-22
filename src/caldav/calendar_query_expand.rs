@@ -23,6 +23,7 @@
 //! This module implements that request type directly against libdav's
 //! public `DavRequest` trait. No libdav-internal helpers touched.
 
+use crate::parsers::datetime::format_for_ics;
 use chrono::{DateTime, Utc};
 use http::{response::Parts, Method, Request, Uri};
 use libdav::dav::make_relative_url;
@@ -75,14 +76,6 @@ impl<'a> CalendarQueryExpand<'a> {
             end_utc: format_for_ics(&end),
         }
     }
-}
-
-/// Format a UTC datetime as an iCalendar-form string (`YYYYMMDDTHHMMSSZ`).
-/// Duplicated locally — there's a similar function in `caldav::utils`
-/// but it's `pub(crate)` inside that module and we don't want to
-/// reach into it.
-fn format_for_ics(dt: &DateTime<Utc>) -> String {
-    dt.format("%Y%m%dT%H%M%SZ").to_string()
 }
 
 /// Response from a [`CalendarQueryExpand`]. Shape matches libdav's

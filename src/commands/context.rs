@@ -6,6 +6,7 @@
 //! Provides shared context for command execution including CLI options.
 
 use crate::cli::OutputFormat;
+use crate::config::Config;
 use chrono_tz::Tz;
 
 /// Command execution context
@@ -27,6 +28,12 @@ pub struct CommandContext {
     /// config > system > UTC). Every local↔UTC parse and every display
     /// conversion uses this — see [`crate::timezone`].
     pub timezone: Tz,
+
+    /// Config parsed once at startup (best-effort). Reused by `load_config`
+    /// so a command doesn't re-read+parse the file; `None` when the initial
+    /// load failed, in which case `load_config` retries and surfaces the
+    /// real error.
+    loaded_config: Option<Config>,
 }
 
 impl CommandContext {
@@ -37,6 +44,7 @@ impl CommandContext {
         calendar: Option<String>,
         dry_run: bool,
         timezone: Tz,
+        loaded_config: Option<Config>,
     ) -> Self {
         Self {
             config_path,
@@ -44,15 +52,19 @@ impl CommandContext {
             calendar,
             dry_run,
             timezone,
+            loaded_config,
         }
     }
 
-    /// Load config using the configured path
-    pub fn load_config(&self) -> anyhow::Result<crate::config::Config> {
+    /// Load config, reusing the copy parsed at startup when available.
+    pub fn load_config(&self) -> anyhow::Result<Config> {
+        if let Some(config) = &self.loaded_config {
+            return Ok(config.clone());
+        }
         if let Some(ref path) = self.config_path {
-            crate::config::Config::load_from(std::path::Path::new(path))
+            Config::load_from(std::path::Path::new(path))
         } else {
-            crate::config::Config::load()
+            Config::load()
         }
     }
 }

@@ -30,17 +30,12 @@ pub(crate) async fn find_event_for_operation(
             .cloned()
             .with_context(|| calendar_not_found_error(cal, config))?;
 
-        let events =
-            caldav::event::list_events(client, &calendar_href, Some(cal.to_string()), None, None)
-                .await
-                .context("Failed to list events")?;
-
-        let event = events
-            .into_iter()
-            .find(|e| e.id == event_id)
-            .with_context(|| format!("Event '{}' not found in calendar '{}'", event_id, cal))?;
-
-        Ok((cal.to_string(), event))
+        // Fast uid.ics path scoped to this one calendar — avoids downloading
+        // and parsing the whole calendar just to find one event by id.
+        caldav::event::find_event_in_calendar(client, cal, &calendar_href, event_id)
+            .await
+            .context("Failed to search for event")?
+            .with_context(|| format!("Event '{}' not found in calendar '{}'", event_id, cal))
     } else {
         caldav::event::find_event_by_id(client, event_id, &config.calendars)
             .await

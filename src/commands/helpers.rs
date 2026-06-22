@@ -159,8 +159,8 @@ pub(crate) fn localize_event_times(event: &mut Event, tz: Tz) {
 }
 
 fn localize_field(field: &mut EventDateTime, tz: Tz) {
-    if let Ok(dt) = DateTime::parse_from_rfc3339(&field.datetime) {
-        field.datetime = dt.with_timezone(&tz).to_rfc3339();
+    if let Some(utc) = field.as_utc() {
+        field.datetime = utc.with_timezone(&tz).to_rfc3339();
         field.timezone = Some(tz.name().to_string());
     }
 }

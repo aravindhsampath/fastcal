@@ -578,14 +578,14 @@ pub async fn update(
         Some(s) => {
             classify(s, ctx.timezone).with_context(|| format!("Failed to parse start time: {s}"))?
         }
-        None => existing_time_spec(&event.start.datetime, event.all_day)
+        None => existing_time_spec(&event.start, event.all_day)
             .context("Failed to parse existing start time")?,
     };
     let end_spec = match &end {
         Some(e) => {
             classify(e, ctx.timezone).with_context(|| format!("Failed to parse end time: {e}"))?
         }
-        None => existing_time_spec(&event.end.datetime, event.all_day)
+        None => existing_time_spec(&event.end, event.all_day)
             .context("Failed to parse existing end time")?,
     };
     if start.is_some() || end_provided {
@@ -776,18 +776,22 @@ pub async fn update(
 }
 
 /// Parse an event's stored start/end into a [`TimeSpec`], honoring whether the
-/// event is all-day (date-only) or timed (RFC3339 UTC).
-fn existing_time_spec(stored: &str, all_day: bool) -> Result<crate::parsers::datetime::TimeSpec> {
+/// event is all-day (date-only) or timed. Interpretation goes through
+/// [`crate::models::EventDateTime`]'s accessors so the storage format lives in
+/// one place.
+fn existing_time_spec(
+    edt: &crate::models::EventDateTime,
+    all_day: bool,
+) -> Result<crate::parsers::datetime::TimeSpec> {
     use crate::parsers::datetime::TimeSpec;
     if all_day {
-        let d = chrono::NaiveDate::parse_from_str(stored, "%Y-%m-%d")
-            .with_context(|| format!("invalid stored all-day date '{stored}'"))?;
-        Ok(TimeSpec::Date(d))
+        edt.as_date()
+            .map(TimeSpec::Date)
+            .with_context(|| format!("invalid stored all-day date '{}'", edt.datetime))
     } else {
-        let dt = DateTime::parse_from_rfc3339(stored)
-            .with_context(|| format!("invalid stored datetime '{stored}'"))?
-            .with_timezone(&Utc);
-        Ok(TimeSpec::Instant(dt))
+        edt.as_utc()
+            .map(TimeSpec::Instant)
+            .with_context(|| format!("invalid stored datetime '{}'", edt.datetime))
     }
 }
 
@@ -949,20 +953,11 @@ pub async fn conflicts(
     // Check for conflicts (overlapping time ranges)
     let mut conflicting_events: Vec<_> = events
         .into_iter()
-        .filter(|event| {
-            let event_start = DateTime::parse_from_rfc3339(&event.start.datetime)
-                .ok()
-                .map(|dt| dt.with_timezone(&chrono::Utc));
-            let event_end = DateTime::parse_from_rfc3339(&event.end.datetime)
-                .ok()
-                .map(|dt| dt.with_timezone(&chrono::Utc));
-
-            match (event_start, event_end) {
-                (Some(evt_start), Some(evt_end)) => {
-                    events_overlap(evt_start, evt_end, proposed_start, proposed_end)
-                }
-                _ => false,
+        .filter(|event| match (event.start.as_utc(), event.end.as_utc()) {
+            (Some(evt_start), Some(evt_end)) => {
+                events_overlap(evt_start, evt_end, proposed_start, proposed_end)
             }
+            _ => false,
         })
         .collect();
 

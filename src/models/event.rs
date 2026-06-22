@@ -5,7 +5,7 @@
 //!
 //! Represents a calendar event with all properties.
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
 
 /// Calendar event
@@ -139,6 +139,21 @@ impl EventDateTime {
     pub fn new(datetime: String, timezone: Option<String>) -> Self {
         Self { datetime, timezone }
     }
+
+    /// Interpret the stored value as a UTC instant. Returns `None` for an
+    /// all-day (date-only) value. This is the single place that knows the
+    /// timed storage format, so callers never hand-roll RFC3339 parsing.
+    pub fn as_utc(&self) -> Option<DateTime<Utc>> {
+        DateTime::parse_from_rfc3339(&self.datetime)
+            .ok()
+            .map(|dt| dt.with_timezone(&Utc))
+    }
+
+    /// Interpret the stored value as an all-day date (`YYYY-MM-DD`). Returns
+    /// `None` for a timed value.
+    pub fn as_date(&self) -> Option<NaiveDate> {
+        NaiveDate::parse_from_str(&self.datetime, "%Y-%m-%d").ok()
+    }
 }
 
 /// Event attendee
@@ -193,5 +208,30 @@ impl std::fmt::Display for EventStatus {
             EventStatus::Tentative => write!(f, "tentative"),
             EventStatus::Cancelled => write!(f, "cancelled"),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn event_datetime_as_utc_reads_timed_value() {
+        let timed = EventDateTime::new(
+            "2026-06-25T12:00:00+02:00".to_string(),
+            Some("Europe/Amsterdam".to_string()),
+        );
+        assert_eq!(
+            timed.as_utc().unwrap().to_rfc3339(),
+            "2026-06-25T10:00:00+00:00"
+        );
+        assert!(timed.as_date().is_none());
+    }
+
+    #[test]
+    fn event_datetime_as_date_reads_all_day_value() {
+        let all_day = EventDateTime::new("2026-06-25".to_string(), None);
+        assert_eq!(all_day.as_date().unwrap().to_string(), "2026-06-25");
+        assert!(all_day.as_utc().is_none());
     }
 }

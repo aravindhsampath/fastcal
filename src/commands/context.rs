@@ -6,6 +6,7 @@
 //! Provides shared context for command execution including CLI options.
 
 use crate::cli::OutputFormat;
+use chrono_tz::Tz;
 
 /// Command execution context
 #[derive(Clone)]
@@ -21,6 +22,11 @@ pub struct CommandContext {
 
     /// Dry-run mode: parse and validate without sending mutations to the server
     pub dry_run: bool,
+
+    /// The single IANA timezone resolved for this invocation (CLI flag >
+    /// config > system > UTC). Every local↔UTC parse and every display
+    /// conversion uses this — see [`crate::timezone`].
+    pub timezone: Tz,
 }
 
 impl CommandContext {
@@ -30,12 +36,14 @@ impl CommandContext {
         format: OutputFormat,
         calendar: Option<String>,
         dry_run: bool,
+        timezone: Tz,
     ) -> Self {
         Self {
             config_path,
             format,
             calendar,
             dry_run,
+            timezone,
         }
     }
 

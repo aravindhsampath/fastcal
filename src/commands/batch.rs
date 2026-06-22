@@ -100,6 +100,7 @@ pub async fn create(
         .context("Failed to create CalDAV client")?;
 
     let total = events.len();
+    let tz = ctx.timezone;
     eprintln!("Dispatching {} create request(s) concurrently...", total);
 
     // Execute all creates concurrently
@@ -110,9 +111,15 @@ pub async fn create(
             let calendar_name = &calendar_name;
             let calendar_href = &calendar_href;
             async move {
-                let result =
-                    create_single_event(client, config, calendar_name, calendar_href, event_input)
-                        .await;
+                let result = create_single_event(
+                    client,
+                    config,
+                    calendar_name,
+                    calendar_href,
+                    event_input,
+                    tz,
+                )
+                .await;
                 (index, result)
             }
         }))
@@ -172,12 +179,14 @@ async fn create_single_event(
     _calendar_name: &str,
     calendar_href: &str,
     event_input: &EventInput,
+    tz: chrono_tz::Tz,
 ) -> Result<String> {
     crate::commands::helpers::create_event_on_server(
         client,
         calendar_href,
         &config.server.username,
         event_input,
+        tz,
     )
     .await
 }

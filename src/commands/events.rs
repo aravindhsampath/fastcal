@@ -42,7 +42,7 @@ pub async fn list(
         .context("Failed to create CalDAV client")?;
 
     // List events
-    let events = caldav::event::list_events(
+    let mut events = caldav::event::list_events(
         &client,
         &calendar_href,
         Some(calendar_name.clone()),
@@ -56,18 +56,24 @@ pub async fn list(
     use crate::cli::OutputFormat;
     match ctx.format {
         OutputFormat::Text => {
-            let output = crate::formatters::format_events(&events, OutputFormat::Text)?;
+            let output =
+                crate::formatters::format_events(&events, OutputFormat::Text, ctx.timezone)?;
             println!("{}", output);
         }
         OutputFormat::Json => {
+            for ev in events.iter_mut() {
+                crate::commands::helpers::localize_event_times(ev, ctx.timezone);
+            }
+
             let mut metadata = Metadata::new()
                 .with_count(events.len())
                 .with_calendar(calendar_name);
 
             if let (Some(from_dt), Some(to_dt)) = (from, to) {
                 metadata = metadata.with_date_range(
-                    from_dt.format("%Y-%m-%d").to_string(),
-                    to_dt.format("%Y-%m-%d").to_string(),
+                    local_date(from_dt, ctx.timezone),
+                    // `to` is the exclusive end; show the inclusive last local day.
+                    local_date(to_dt - chrono::Duration::seconds(1), ctx.timezone),
                 );
             }
 
@@ -88,6 +94,11 @@ pub async fn list(
     Ok(())
 }
 
+/// Format a UTC instant as a `YYYY-MM-DD` date in the resolved zone.
+fn local_date(dt: DateTime<Utc>, tz: chrono_tz::Tz) -> String {
+    dt.with_timezone(&tz).format("%Y-%m-%d").to_string()
+}
+
 /// Execute events get command
 ///
 /// Gets a specific event by ID
@@ -101,7 +112,7 @@ pub async fn get(ctx: &crate::commands::context::CommandContext, event_id: Strin
         .await
         .context("Failed to create CalDAV client")?;
 
-    let (found_calendar, event) = crate::commands::helpers::find_event_for_operation(
+    let (found_calendar, mut event) = crate::commands::helpers::find_event_for_operation(
         &client,
         &config,
         ctx.calendar.as_deref(),
@@ -113,10 +124,11 @@ pub async fn get(ctx: &crate::commands::context::CommandContext, event_id: Strin
     match ctx.format {
         OutputFormat::Text => {
             println!("Calendar: {}\n", found_calendar);
-            let output = crate::formatters::text::format_event(&event)?;
+            let output = crate::formatters::text::format_event(&event, ctx.timezone)?;
             println!("{}", output);
         }
         OutputFormat::Json => {
+            crate::commands::helpers::localize_event_times(&mut event, ctx.timezone);
             let response = SuccessResponse::new(json!({
                 "event": event,
                 "calendar": found_calendar,
@@ -235,28 +247,46 @@ pub async fn create(
         reminder_minutes,
     };
 
-    // Dry-run: compute what would be created without hitting the server
+    // Dry-run: compute what would be created without hitting the server.
+    // Uses the same resolver as the real create so the preview can't drift.
     if ctx.dry_run {
-        let start_dt = crate::parsers::datetime::parse_datetime(&event_input.start)
-            .with_context(|| format!("Failed to parse start time: {}", event_input.start))?;
-        let end_dt = if let Some(ref end_str) = event_input.end {
-            crate::parsers::datetime::parse_datetime(end_str)
-                .with_context(|| format!("Failed to parse end time: {}", end_str))?
-        } else if let Some(dur_mins) = event_input.duration {
-            start_dt + chrono::Duration::minutes(dur_mins as i64)
-        } else {
-            start_dt + chrono::Duration::hours(1)
-        };
-        let duration_minutes = end_dt.signed_duration_since(start_dt).num_minutes();
+        let tz = ctx.timezone;
+        let times = crate::commands::helpers::resolve_event_times(&event_input, tz)?;
 
         use crate::cli::OutputFormat;
         match ctx.format {
             OutputFormat::Text => {
                 println!("[DRY RUN] Would create event in '{}':", calendar_name);
                 println!("  Summary:  {}", event_input.summary);
-                println!("  Start:    {} UTC", start_dt.format("%a %b %d, %I:%M %p"));
-                println!("  End:      {} UTC", end_dt.format("%a %b %d, %I:%M %p"));
-                println!("  Duration: {} minutes", duration_minutes);
+                if times.all_day {
+                    let start = times.start_date.expect("all-day has start_date");
+                    let end = times.end_date_inclusive.expect("all-day has end date");
+                    if end <= start {
+                        println!("  Date:     {} (all-day)", start.format("%a %b %d, %Y"));
+                    } else {
+                        println!(
+                            "  Dates:    {} – {} (all-day)",
+                            start.format("%a %b %d, %Y"),
+                            end.format("%a %b %d, %Y")
+                        );
+                    }
+                } else {
+                    let start = times
+                        .start_utc
+                        .expect("timed has start_utc")
+                        .with_timezone(&tz);
+                    let end = times.end_utc.expect("timed has end_utc").with_timezone(&tz);
+                    println!(
+                        "  Start:    {}",
+                        start.format("%a %b %d, %Y %I:%M %p %Z (%:z)")
+                    );
+                    println!(
+                        "  End:      {}",
+                        end.format("%a %b %d, %Y %I:%M %p %Z (%:z)")
+                    );
+                    let mins = (times.end_utc.unwrap() - times.start_utc.unwrap()).num_minutes();
+                    println!("  Duration: {} minutes", mins);
+                }
                 if let Some(ref loc) = event_input.location {
                     println!("  Location: {}", loc);
                 }
@@ -274,19 +304,38 @@ pub async fn create(
                 // Mirror the `Reminder` shape that parse→serialize would
                 // produce, so a dry-run preview and a real create emit the
                 // same field names downstream.
-                let reminders_json = event_input.reminder_minutes.map(|m| {
-                    json!([{
-                        "minutes_before": m,
-                        "action": "display",
-                    }])
-                });
+                let reminders_json = event_input
+                    .reminder_minutes
+                    .map(|m| json!([{ "minutes_before": m, "action": "display" }]));
+                // Preview reflects intent in the resolved zone: localized
+                // instants for timed events, inclusive local dates for all-day.
+                let (start_json, end_json, duration_json) = if times.all_day {
+                    (
+                        json!(times.start_date.unwrap().format("%Y-%m-%d").to_string()),
+                        json!(times
+                            .end_date_inclusive
+                            .unwrap()
+                            .format("%Y-%m-%d")
+                            .to_string()),
+                        json!(null),
+                    )
+                } else {
+                    let s = times.start_utc.unwrap();
+                    let e = times.end_utc.unwrap();
+                    (
+                        json!(s.with_timezone(&tz).to_rfc3339()),
+                        json!(e.with_timezone(&tz).to_rfc3339()),
+                        json!((e - s).num_minutes()),
+                    )
+                };
                 let response = SuccessResponse::new(json!({
                     "dry_run": true,
                     "would_create": {
                         "summary": event_input.summary,
-                        "start": start_dt.to_rfc3339(),
-                        "end": end_dt.to_rfc3339(),
-                        "duration_minutes": duration_minutes,
+                        "all_day": times.all_day,
+                        "start": start_json,
+                        "end": end_json,
+                        "duration_minutes": duration_json,
                         "location": event_input.location,
                         "description": event_input.description,
                         "attendees": event_input.attendees,
@@ -308,6 +357,7 @@ pub async fn create(
         &calendar_href,
         &config.server.username,
         &event_input,
+        ctx.timezone,
     )
     .await?;
 
@@ -319,7 +369,7 @@ pub async fn create(
         .await
         .context("Failed to fetch created event")?;
 
-    let event = resources
+    let mut event = resources
         .resources
         .into_iter()
         .find_map(|r| {
@@ -333,10 +383,11 @@ pub async fn create(
     match ctx.format {
         OutputFormat::Text => {
             println!("Event created successfully in '{}':\n", calendar_name);
-            let output = crate::formatters::text::format_event(&event)?;
+            let output = crate::formatters::text::format_event(&event, ctx.timezone)?;
             println!("{}", output);
         }
         OutputFormat::Json => {
+            crate::commands::helpers::localize_event_times(&mut event, ctx.timezone);
             let response = SuccessResponse::new(json!({
                 "event": event,
                 "calendar": calendar_name,
@@ -369,13 +420,15 @@ pub async fn delete(
         .await
         .context("Failed to create CalDAV client")?;
 
-    let (calendar_name, event) = crate::commands::helpers::find_event_for_operation(
+    let (calendar_name, mut event) = crate::commands::helpers::find_event_for_operation(
         &client,
         &config,
         ctx.calendar.as_deref(),
         &event_id,
     )
     .await?;
+    // Show times in the resolved zone for the preview/confirmation.
+    crate::commands::helpers::localize_event_times(&mut event, ctx.timezone);
 
     // Dry-run: show what would be deleted without hitting the server
     if ctx.dry_run {
@@ -530,32 +583,74 @@ pub async fn update(
         changed = true;
     }
 
-    // Update start time if provided
-    let start_dt_utc = if let Some(start_str) = start {
-        let dt = crate::parsers::datetime::parse_datetime(&start_str)
-            .with_context(|| format!("Failed to parse start time: {}", start_str))?;
-        event.start.datetime = dt.to_rfc3339();
-        changed = true;
-        dt
-    } else {
-        // Parse existing start time
-        DateTime::parse_from_rfc3339(&event.start.datetime)
-            .with_context(|| "Failed to parse existing start time")?
-            .with_timezone(&Utc)
-    };
+    // Resolve new start/end honoring the resolved zone and all-day events.
+    // Each side comes from the explicit patch (classified in `tz`) or is
+    // carried over from the stored event. A date-only value keeps/makes the
+    // event all-day; mixing a date and a time across start/end is rejected.
+    // `start_ics`/`end_ics` are the ICS wire values (date or `…Z`).
+    use crate::parsers::datetime::{classify, format_date_for_ics, format_for_ics, TimeSpec};
 
-    // Update end time if provided
-    let end_dt_utc = if let Some(end_str) = end {
-        let dt = crate::parsers::datetime::parse_datetime(&end_str)
-            .with_context(|| format!("Failed to parse end time: {}", end_str))?;
-        event.end.datetime = dt.to_rfc3339();
+    let end_provided = end.is_some();
+    let start_spec = match &start {
+        Some(s) => {
+            classify(s, ctx.timezone).with_context(|| format!("Failed to parse start time: {s}"))?
+        }
+        None => existing_time_spec(&event.start.datetime, event.all_day)
+            .context("Failed to parse existing start time")?,
+    };
+    let end_spec = match &end {
+        Some(e) => {
+            classify(e, ctx.timezone).with_context(|| format!("Failed to parse end time: {e}"))?
+        }
+        None => existing_time_spec(&event.end.datetime, event.all_day)
+            .context("Failed to parse existing end time")?,
+    };
+    if start.is_some() || end_provided {
         changed = true;
-        dt
-    } else {
-        // Parse existing end time
-        DateTime::parse_from_rfc3339(&event.end.datetime)
-            .with_context(|| "Failed to parse existing end time")?
-            .with_timezone(&Utc)
+    }
+
+    let (start_ics, end_ics) = match (start_spec, end_spec) {
+        (TimeSpec::Date(start_date), TimeSpec::Date(end_date)) => {
+            // All-day. A user-supplied end is an inclusive last day; an end
+            // carried over from the stored event is already the exclusive
+            // RFC 5545 DTEND.
+            let end_exclusive = if end_provided {
+                end_date.succ_opt().context("end date is out of range")?
+            } else {
+                end_date
+            };
+            if end_exclusive <= start_date {
+                anyhow::bail!("end date must be on or after start date");
+            }
+            event.all_day = true;
+            event.start =
+                crate::models::EventDateTime::new(start_date.format("%Y-%m-%d").to_string(), None);
+            event.end = crate::models::EventDateTime::new(
+                end_exclusive.format("%Y-%m-%d").to_string(),
+                None,
+            );
+            event.duration_minutes = Some((end_exclusive - start_date).num_days() * 1440);
+            (
+                format_date_for_ics(&start_date),
+                format_date_for_ics(&end_exclusive),
+            )
+        }
+        (TimeSpec::Instant(start_dt), TimeSpec::Instant(end_dt)) => {
+            if end_dt < start_dt {
+                anyhow::bail!("end time must be after start time");
+            }
+            event.all_day = false;
+            event.start =
+                crate::models::EventDateTime::new(start_dt.to_rfc3339(), Some("UTC".to_owned()));
+            event.end =
+                crate::models::EventDateTime::new(end_dt.to_rfc3339(), Some("UTC".to_owned()));
+            event.duration_minutes = Some((end_dt - start_dt).num_minutes());
+            (format_for_ics(&start_dt), format_for_ics(&end_dt))
+        }
+        _ => anyhow::bail!(
+            "start and end must both be dates (all-day) or both be times; \
+             to convert an event between all-day and timed, set both --start and --end"
+        ),
     };
 
     // Update location if provided
@@ -625,15 +720,15 @@ pub async fn update(
 
     // Dry-run: show the modified event without PUTting to the server
     if ctx.dry_run {
-        event.duration_minutes = Some(end_dt_utc.signed_duration_since(start_dt_utc).num_minutes());
         use crate::cli::OutputFormat;
         match ctx.format {
             OutputFormat::Text => {
                 println!("[DRY RUN] Would update event in '{}':", calendar_name);
-                let output = crate::formatters::text::format_event(&event)?;
+                let output = crate::formatters::text::format_event(&event, ctx.timezone)?;
                 println!("{}", output);
             }
             OutputFormat::Json => {
+                crate::commands::helpers::localize_event_times(&mut event, ctx.timezone);
                 let response = SuccessResponse::new(json!({
                     "dry_run": true,
                     "would_update": event,
@@ -654,9 +749,7 @@ pub async fn update(
         .as_ref()
         .map(|att_vec| att_vec.iter().map(|a| a.email.clone()).collect::<Vec<_>>());
 
-    // Build updated ICS event
-    let start_ics = crate::parsers::datetime::format_for_ics(&start_dt_utc);
-    let end_ics = crate::parsers::datetime::format_for_ics(&end_dt_utc);
+    // Build updated ICS event (start_ics/end_ics resolved above).
     let ics_data = crate::parsers::ics::build_event(&crate::parsers::ics::IcsBuildArgs {
         uid: &event.id,
         summary: &event.summary,
@@ -680,17 +773,16 @@ pub async fn update(
     })
     .await?;
 
-    // Recalculate duration from updated start/end times
-    event.duration_minutes = Some(end_dt_utc.signed_duration_since(start_dt_utc).num_minutes());
-
+    // Duration was set when resolving start/end above.
     use crate::cli::OutputFormat;
     match ctx.format {
         OutputFormat::Text => {
             println!("Event updated successfully in '{}':\n", calendar_name);
-            let output = crate::formatters::text::format_event(&event)?;
+            let output = crate::formatters::text::format_event(&event, ctx.timezone)?;
             println!("{}", output);
         }
         OutputFormat::Json => {
+            crate::commands::helpers::localize_event_times(&mut event, ctx.timezone);
             let response = SuccessResponse::new(json!({
                 "event": event,
                 "calendar": calendar_name,
@@ -704,6 +796,22 @@ pub async fn update(
     }
 
     Ok(())
+}
+
+/// Parse an event's stored start/end into a [`TimeSpec`], honoring whether the
+/// event is all-day (date-only) or timed (RFC3339 UTC).
+fn existing_time_spec(stored: &str, all_day: bool) -> Result<crate::parsers::datetime::TimeSpec> {
+    use crate::parsers::datetime::TimeSpec;
+    if all_day {
+        let d = chrono::NaiveDate::parse_from_str(stored, "%Y-%m-%d")
+            .with_context(|| format!("invalid stored all-day date '{stored}'"))?;
+        Ok(TimeSpec::Date(d))
+    } else {
+        let dt = DateTime::parse_from_rfc3339(stored)
+            .with_context(|| format!("invalid stored datetime '{stored}'"))?
+            .with_timezone(&Utc);
+        Ok(TimeSpec::Instant(dt))
+    }
 }
 
 /// Execute events search command
@@ -752,7 +860,7 @@ pub async fn search(
 
     // Filter events by query (case-insensitive search in summary and description)
     let query_lower = query.to_lowercase();
-    let matching_events: Vec<_> = events
+    let mut matching_events: Vec<_> = events
         .into_iter()
         .filter(|event| {
             event.summary.to_lowercase().contains(&query_lower)
@@ -768,18 +876,26 @@ pub async fn search(
     use crate::cli::OutputFormat;
     match ctx.format {
         OutputFormat::Text => {
-            let output = crate::formatters::text::format_search_results(&query, &matching_events)?;
+            let output = crate::formatters::text::format_search_results(
+                &query,
+                &matching_events,
+                ctx.timezone,
+            )?;
             println!("{}", output);
         }
         OutputFormat::Json => {
+            for ev in matching_events.iter_mut() {
+                crate::commands::helpers::localize_event_times(ev, ctx.timezone);
+            }
+
             let mut metadata = Metadata::new()
                 .with_count(matching_events.len())
                 .with_calendar(calendar_name);
 
             if let (Some(from_dt), Some(to_dt)) = (from, to) {
                 metadata = metadata.with_date_range(
-                    from_dt.format("%Y-%m-%d").to_string(),
-                    to_dt.format("%Y-%m-%d").to_string(),
+                    local_date(from_dt, ctx.timezone),
+                    local_date(to_dt - chrono::Duration::seconds(1), ctx.timezone),
                 );
             }
 
@@ -813,10 +929,10 @@ pub async fn conflicts(
         .load_config()
         .context("Failed to load configuration. Run 'fastcal config init' first.")?;
 
-    // Parse proposed time range
-    let proposed_start = crate::parsers::datetime::parse_datetime(&start)
+    // Parse proposed time range in the resolved zone
+    let proposed_start = crate::parsers::datetime::parse_datetime(&start, ctx.timezone)
         .with_context(|| format!("Failed to parse start time: {}", start))?;
-    let proposed_end = crate::parsers::datetime::parse_datetime(&end)
+    let proposed_end = crate::parsers::datetime::parse_datetime(&end, ctx.timezone)
         .with_context(|| format!("Failed to parse end time: {}", end))?;
 
     // Validate time range
@@ -857,7 +973,7 @@ pub async fn conflicts(
     .context("Failed to list events")?;
 
     // Check for conflicts (overlapping time ranges)
-    let conflicting_events: Vec<_> = events
+    let mut conflicting_events: Vec<_> = events
         .into_iter()
         .filter(|event| {
             let event_start = DateTime::parse_from_rfc3339(&event.start.datetime)
@@ -886,14 +1002,19 @@ pub async fn conflicts(
                 &proposed_start.to_rfc3339(),
                 &proposed_end.to_rfc3339(),
                 &conflicting_events,
+                ctx.timezone,
             )?;
             println!("{}", output);
         }
         OutputFormat::Json => {
+            for ev in conflicting_events.iter_mut() {
+                crate::commands::helpers::localize_event_times(ev, ctx.timezone);
+            }
+            let tz = ctx.timezone;
             let response = SuccessResponse::new(json!({
                 "proposed_time": {
-                    "start": proposed_start.to_rfc3339(),
-                    "end": proposed_end.to_rfc3339(),
+                    "start": proposed_start.with_timezone(&tz).to_rfc3339(),
+                    "end": proposed_end.with_timezone(&tz).to_rfc3339(),
                 },
                 "has_conflicts": has_conflicts,
                 "conflicts": conflicting_events,

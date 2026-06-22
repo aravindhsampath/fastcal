@@ -78,6 +78,12 @@ pub async fn init(_ctx: &crate::commands::context::CommandContext) -> Result<()>
     let mut config = Config::minimal(username, password);
     config::discovery::update_config_with_discovery(&mut config, discovery_result);
 
+    // Pre-fill the timezone from the host system so a fresh setup matches
+    // where the user actually is (instead of a baked-in default).
+    let detected_tz = crate::timezone::detect_system_tz();
+    println!("  Detected timezone: {}", detected_tz);
+    config.preferences.default_timezone = detected_tz;
+
     // Save config
     let config_path = Config::config_path()?;
     config.save().context("Failed to save configuration")?;
@@ -198,6 +204,9 @@ pub async fn set(
             config.preferences.default_calendar = value.clone();
         }
         "preferences.default_timezone" => {
+            // Validate up front so a bad zone can't be persisted and then
+            // break every later command at resolution time.
+            crate::timezone::parse_tz(&value).context("cannot set default_timezone")?;
             config.preferences.default_timezone = value.clone();
         }
         "preferences.output_format" => {

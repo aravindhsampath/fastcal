@@ -13,6 +13,7 @@ mod config;
 mod formatters;
 mod models;
 mod parsers;
+mod timezone;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {

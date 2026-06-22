@@ -779,8 +779,11 @@ pub fn build_event(args: &IcsBuildArgs<'_>) -> Result<String> {
         "DTSTAMP:{}",
         chrono::Utc::now().format("%Y%m%dT%H%M%SZ")
     )));
-    ics.push_str(&fold_line(&format!("DTSTART:{}", start)));
-    ics.push_str(&fold_line(&format!("DTEND:{}", end)));
+    // An 8-digit date value (no `T`) is an all-day boundary and must carry
+    // `;VALUE=DATE`; a `…T…Z` value is a timed instant. Detecting from the
+    // value shape keeps callers from threading a separate all-day flag.
+    ics.push_str(&fold_line(&dt_line("DTSTART", start)));
+    ics.push_str(&fold_line(&dt_line("DTEND", end)));
     ics.push_str(&fold_line(&format!("SUMMARY:{}", escape_ics_text(summary))));
 
     if let Some(desc) = description {
@@ -839,6 +842,17 @@ pub fn build_event(args: &IcsBuildArgs<'_>) -> Result<String> {
     ICalendar::parse(&ics).map_err(|e| anyhow::anyhow!("Generated invalid ICS: {:?}", e))?;
 
     Ok(ics)
+}
+
+/// Build a `DTSTART`/`DTEND` content line, tagging date-only values (no `T`,
+/// e.g. `20260625`) with `;VALUE=DATE` for all-day events and leaving timed
+/// `…T…Z` values bare.
+fn dt_line(prop: &str, value: &str) -> String {
+    if value.contains('T') {
+        format!("{prop}:{value}")
+    } else {
+        format!("{prop};VALUE=DATE:{value}")
+    }
 }
 
 /// Fold a content line to comply with RFC 5545 §3.1 (max 75 octets per line).
@@ -948,6 +962,65 @@ mod tests {
     fn test_escape_ics_text() {
         assert_eq!(escape_ics_text("Hello, World"), "Hello\\, World");
         assert_eq!(escape_ics_text("Line1\nLine2"), "Line1\\nLine2");
+    }
+
+    #[test]
+    fn build_all_day_event_emits_value_date() {
+        // Date-only ICS values (no `T`) must be tagged `;VALUE=DATE`.
+        let ics = build_event(&IcsBuildArgs {
+            uid: "all-day-build",
+            summary: "Conference",
+            start: "20260625",
+            end: "20260628",
+            description: None,
+            location: None,
+            organizer: None,
+            attendees: None,
+            reminders: &[],
+        })
+        .unwrap();
+        assert!(ics.contains("DTSTART;VALUE=DATE:20260625"), "got: {ics}");
+        assert!(ics.contains("DTEND;VALUE=DATE:20260628"), "got: {ics}");
+    }
+
+    #[test]
+    fn all_day_event_round_trips() {
+        // Build → parse keeps it all-day with the original dates.
+        let ics = build_event(&IcsBuildArgs {
+            uid: "rt-all-day",
+            summary: "Holiday",
+            start: "20260625",
+            end: "20260626",
+            description: None,
+            location: None,
+            organizer: None,
+            attendees: None,
+            reminders: &[],
+        })
+        .unwrap();
+        let ev = parse_event(&ics, "/rt.ics".to_owned(), None).unwrap();
+        assert!(ev.all_day);
+        assert_eq!(ev.start.datetime, "2026-06-25");
+        assert_eq!(ev.end.datetime, "2026-06-26");
+    }
+
+    #[test]
+    fn timed_event_still_emits_bare_dtstart() {
+        // Regression guard: timed values keep the un-parameterized form.
+        let ics = build_event(&IcsBuildArgs {
+            uid: "timed",
+            summary: "Call",
+            start: "20260625T120000Z",
+            end: "20260625T130000Z",
+            description: None,
+            location: None,
+            organizer: None,
+            attendees: None,
+            reminders: &[],
+        })
+        .unwrap();
+        assert!(ics.contains("DTSTART:20260625T120000Z"), "got: {ics}");
+        assert!(!ics.contains("VALUE=DATE"), "got: {ics}");
     }
 
     #[test]

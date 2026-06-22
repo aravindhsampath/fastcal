@@ -1,51 +1,89 @@
 // Copyright 2026 Aravindh Sampath Kumar
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! Text output formatter
+//! Text output formatter — the UTC→local display boundary.
 //!
-//! Provides human-readable text output for terminal display.
+//! Event instants are stored in UTC; here they are rendered in the resolved
+//! IANA zone with an explicit `CEST (+02:00)` style label. All-day events are
+//! shown date-only and never given a time or offset.
 
 use crate::models::Event;
 use anyhow::Result;
-use chrono::DateTime;
+use chrono::{DateTime, NaiveDate};
+use chrono_tz::Tz;
+
+/// chrono format fragment for the zone label, e.g. ` CEST (+02:00)`.
+const ZONE_LABEL: &str = "%Z (%:z)";
+
+/// Render a stored RFC3339 datetime string in `tz` using `fmt`. Falls back to
+/// the raw string if it can't be parsed.
+fn fmt_local(datetime: &str, tz: Tz, fmt: &str) -> String {
+    match DateTime::parse_from_rfc3339(datetime) {
+        Ok(dt) => dt.with_timezone(&tz).format(fmt).to_string(),
+        Err(_) => datetime.to_string(),
+    }
+}
+
+/// Render an all-day event's date span (date-only, no zone). The stored
+/// `end` is the RFC 5545 exclusive end, so the inclusive last day is `end-1`.
+fn format_all_day(event: &Event) -> String {
+    let start = NaiveDate::parse_from_str(&event.start.datetime, "%Y-%m-%d").ok();
+    let end_excl = NaiveDate::parse_from_str(&event.end.datetime, "%Y-%m-%d").ok();
+    match (start, end_excl) {
+        (Some(s), Some(e)) => {
+            let last = e.pred_opt().unwrap_or(s);
+            if last <= s {
+                format!("{} (all-day)", s.format("%a %b %d, %Y"))
+            } else {
+                format!(
+                    "{} – {} (all-day)",
+                    s.format("%a %b %d, %Y"),
+                    last.format("%a %b %d, %Y")
+                )
+            }
+        }
+        _ => format!("{} (all-day)", event.start.datetime),
+    }
+}
 
 /// Format multiple events as human-readable text
-pub fn format_events(events: &[Event]) -> Result<String> {
+pub fn format_events(events: &[Event], tz: Tz) -> Result<String> {
     if events.is_empty() {
         return Ok("No events found.".to_string());
     }
 
     let mut output = String::new();
-
     output.push_str(&format!("Found {} event(s):\n\n", events.len()));
 
     for (i, event) in events.iter().enumerate() {
         if i > 0 {
             output.push_str("\n---\n\n");
         }
-        output.push_str(&format_event_compact(event)?);
+        output.push_str(&format_event_compact(event, tz)?);
     }
 
     Ok(output)
 }
 
 /// Format a single event as human-readable text (detailed)
-pub fn format_event(event: &Event) -> Result<String> {
+pub fn format_event(event: &Event, tz: Tz) -> Result<String> {
     let mut output = String::new();
 
     output.push_str(&format!("Event: {}\n", event.summary));
     output.push_str(&format!("ID: {}\n", event.id));
 
-    // Parse and format datetime
-    let start_dt = DateTime::parse_from_rfc3339(&event.start.datetime)
-        .map(|dt| dt.format("%A, %B %d, %Y at %I:%M %p UTC").to_string())
-        .unwrap_or_else(|_| event.start.datetime.clone());
-
-    let end_dt = DateTime::parse_from_rfc3339(&event.end.datetime)
-        .map(|dt| dt.format("%I:%M %p UTC").to_string())
-        .unwrap_or_else(|_| event.end.datetime.clone());
-
-    output.push_str(&format!("When: {} - {}\n", start_dt, end_dt));
+    let when = if event.all_day {
+        format_all_day(event)
+    } else {
+        let start = fmt_local(
+            &event.start.datetime,
+            tz,
+            &format!("%A, %B %d, %Y at %I:%M %p {ZONE_LABEL}"),
+        );
+        let end = fmt_local(&event.end.datetime, tz, &format!("%I:%M %p {ZONE_LABEL}"));
+        format!("{} - {}", start, end)
+    };
+    output.push_str(&format!("When: {}\n", when));
 
     if let Some(duration) = event.duration_minutes {
         output.push_str(&format!("Duration: {} minutes\n", duration));
@@ -79,16 +117,21 @@ pub fn format_event(event: &Event) -> Result<String> {
 }
 
 /// Format a single event as compact text (for lists)
-fn format_event_compact(event: &Event) -> Result<String> {
+fn format_event_compact(event: &Event, tz: Tz) -> Result<String> {
     let mut output = String::new();
 
-    // Parse and format datetime
-    let start_dt = DateTime::parse_from_rfc3339(&event.start.datetime)
-        .map(|dt| dt.format("%a %b %d, %I:%M %p UTC").to_string())
-        .unwrap_or_else(|_| event.start.datetime.clone());
+    let when = if event.all_day {
+        format_all_day(event)
+    } else {
+        fmt_local(
+            &event.start.datetime,
+            tz,
+            &format!("%a %b %d, %I:%M %p {ZONE_LABEL}"),
+        )
+    };
 
     output.push_str(&format!("📅 {}\n", event.summary));
-    output.push_str(&format!("   {}\n", start_dt));
+    output.push_str(&format!("   {}\n", when));
 
     if let Some(ref location) = event.location {
         output.push_str(&format!("   📍 {}\n", location));
@@ -104,7 +147,7 @@ fn format_event_compact(event: &Event) -> Result<String> {
 }
 
 /// Format search results as text
-pub fn format_search_results(query: &str, matches: &[Event]) -> Result<String> {
+pub fn format_search_results(query: &str, matches: &[Event], tz: Tz) -> Result<String> {
     let mut output = String::new();
 
     output.push_str(&format!(
@@ -120,33 +163,31 @@ pub fn format_search_results(query: &str, matches: &[Event]) -> Result<String> {
             if i > 0 {
                 output.push('\n');
             }
-            output.push_str(&format_event_compact(event)?);
+            output.push_str(&format_event_compact(event, tz)?);
         }
     }
 
     Ok(output)
 }
 
-/// Format conflict detection results as text
+/// Format conflict detection results as text. `proposed_start`/`proposed_end`
+/// are RFC3339 strings; they are shown in `tz`.
 pub fn format_conflicts(
     proposed_start: &str,
     proposed_end: &str,
     conflicts: &[Event],
+    tz: Tz,
 ) -> Result<String> {
     let mut output = String::new();
 
-    let start_dt = DateTime::parse_from_rfc3339(proposed_start)
-        .map(|dt| dt.format("%A, %B %d, %Y at %I:%M %p UTC").to_string())
-        .unwrap_or_else(|_| proposed_start.to_string());
+    let start = fmt_local(
+        proposed_start,
+        tz,
+        &format!("%A, %B %d, %Y at %I:%M %p {ZONE_LABEL}"),
+    );
+    let end = fmt_local(proposed_end, tz, &format!("%I:%M %p {ZONE_LABEL}"));
 
-    let end_dt = DateTime::parse_from_rfc3339(proposed_end)
-        .map(|dt| dt.format("%I:%M %p UTC").to_string())
-        .unwrap_or_else(|_| proposed_end.to_string());
-
-    output.push_str(&format!(
-        "Checking for conflicts: {} - {}\n\n",
-        start_dt, end_dt
-    ));
+    output.push_str(&format!("Checking for conflicts: {} - {}\n\n", start, end));
 
     if conflicts.is_empty() {
         output.push_str("✓ No conflicts found. Time slot is available!\n");
@@ -156,7 +197,7 @@ pub fn format_conflicts(
             if i > 0 {
                 output.push('\n');
             }
-            output.push_str(&format_event_compact(event)?);
+            output.push_str(&format_event_compact(event, tz)?);
         }
     }
 
@@ -199,4 +240,86 @@ pub fn format_calendar_info(name: &str, cal: &serde_json::Value) -> Result<Strin
         output.push_str(&format!("   color:         {}\n", color));
     }
     Ok(output.trim_end().to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::models::EventDateTime;
+
+    fn timed_event() -> Event {
+        Event {
+            id: "evt-1".into(),
+            href: "/evt-1.ics".into(),
+            calendar: None,
+            summary: "Standup".into(),
+            description: None,
+            // 12:00 CEST == 10:00 UTC
+            start: EventDateTime::new("2026-06-22T10:00:00+00:00".into(), Some("UTC".into())),
+            end: EventDateTime::new("2026-06-22T11:00:00+00:00".into(), Some("UTC".into())),
+            duration_minutes: Some(60),
+            location: None,
+            attendees: None,
+            status: None,
+            created: None,
+            modified: None,
+            organizer: None,
+            all_day: false,
+            etag: None,
+            rrule: None,
+            recurrence_id: None,
+            reminders: vec![],
+        }
+    }
+
+    fn all_day_event() -> Event {
+        Event {
+            all_day: true,
+            // exclusive end == start + 1 → single day
+            start: EventDateTime::new("2026-06-25".into(), None),
+            end: EventDateTime::new("2026-06-26".into(), None),
+            duration_minutes: None,
+            ..timed_event()
+        }
+    }
+
+    #[test]
+    fn timed_event_renders_in_zone_with_label() {
+        let ams = Tz::Europe__Amsterdam;
+        let out = format_event(&timed_event(), ams).unwrap();
+        // 10:00 UTC → 12:00 CEST (+02:00); no bare "UTC".
+        assert!(out.contains("12:00 PM"), "got: {out}");
+        assert!(out.contains("CEST"), "got: {out}");
+        assert!(out.contains("+02:00"), "got: {out}");
+        assert!(!out.contains(" UTC"), "should not print UTC: {out}");
+    }
+
+    #[test]
+    fn timed_event_winter_uses_cet() {
+        let ams = Tz::Europe__Amsterdam;
+        let mut ev = timed_event();
+        ev.start = EventDateTime::new("2026-01-15T10:00:00+00:00".into(), Some("UTC".into()));
+        ev.end = EventDateTime::new("2026-01-15T11:00:00+00:00".into(), Some("UTC".into()));
+        let out = format_event(&ev, ams).unwrap();
+        // 10:00 UTC → 11:00 CET (+01:00) in winter.
+        assert!(out.contains("11:00 AM"), "got: {out}");
+        assert!(out.contains("CET"), "got: {out}");
+        assert!(out.contains("+01:00"), "got: {out}");
+    }
+
+    #[test]
+    fn all_day_event_is_date_only_no_zone() {
+        let ams = Tz::Europe__Amsterdam;
+        let out = format_event(&all_day_event(), ams).unwrap();
+        assert!(out.contains("all-day"), "got: {out}");
+        assert!(out.contains("Jun 25, 2026"), "got: {out}");
+        assert!(
+            !out.contains("CEST"),
+            "all-day must not carry a zone: {out}"
+        );
+        assert!(
+            !out.contains(":00 "),
+            "all-day must not carry a time: {out}"
+        );
+    }
 }

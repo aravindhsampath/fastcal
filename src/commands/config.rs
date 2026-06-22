@@ -178,9 +178,6 @@ pub async fn show(ctx: &crate::commands::context::CommandContext) -> Result<()> 
             }));
             println!("{}", serde_json::to_string_pretty(&response)?);
         }
-        OutputFormat::Ics => {
-            anyhow::bail!("ICS format is not applicable to config commands");
-        }
     }
 
     Ok(())
@@ -210,8 +207,8 @@ pub async fn set(
             config.preferences.default_timezone = value.clone();
         }
         "preferences.output_format" => {
-            if !["json", "ics", "text"].contains(&value.as_str()) {
-                anyhow::bail!("Invalid output format. Must be: json, ics, or text");
+            if !["json", "text"].contains(&value.as_str()) {
+                anyhow::bail!("Invalid output format. Must be: json or text");
             }
             config.preferences.output_format = value.clone();
         }
@@ -233,9 +230,6 @@ pub async fn set(
                 "message": format!("Configuration updated: {} = {}", key, value)
             }));
             println!("{}", serde_json::to_string_pretty(&response)?);
-        }
-        OutputFormat::Ics => {
-            anyhow::bail!("ICS format is not applicable to config commands");
         }
     }
 
@@ -295,9 +289,6 @@ pub async fn test(ctx: &crate::commands::context::CommandContext) -> Result<()> 
                         "calendars_configured": config.calendars.len(),
                     }));
                     println!("{}", serde_json::to_string_pretty(&response)?);
-                }
-                OutputFormat::Ics => {
-                    anyhow::bail!("ICS format is not applicable to config commands");
                 }
             }
             Ok(())

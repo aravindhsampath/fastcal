@@ -252,7 +252,11 @@ async fn scan_calendar_for_event(
     {
         Ok(r) => r,
         Err(e) => {
-            log::warn!("Failed to fetch events in calendar {}: {}", calendar_name, e);
+            log::warn!(
+                "Failed to fetch events in calendar {}: {}",
+                calendar_name,
+                e
+            );
             return None;
         }
     };
@@ -269,7 +273,8 @@ fn find_matching_event(
 ) -> Option<(String, Event)> {
     for resource in resources {
         if let Ok(fetched) = resource.content {
-            if let Ok(mut event) = ics::parse_event(&fetched.data, resource.href, Some(fetched.etag))
+            if let Ok(mut event) =
+                ics::parse_event(&fetched.data, resource.href, Some(fetched.etag))
             {
                 if event.id == event_id {
                     event.calendar = Some(calendar_name.to_string());

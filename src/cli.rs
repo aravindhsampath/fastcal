@@ -7,7 +7,6 @@ use clap_complete::Shell;
 #[derive(Clone, Copy, ValueEnum)]
 pub enum OutputFormat {
     Json,
-    Ics,
     Text,
 }
 
@@ -274,7 +273,6 @@ impl Cli {
                 .map(|c| c.preferences.output_format.as_str())
             {
                 Some("json") => OutputFormat::Json,
-                Some("ics") => OutputFormat::Ics,
                 _ => OutputFormat::Text,
             }
         });
@@ -322,18 +320,21 @@ impl Cli {
                 match command {
                     EventCommands::List { from, to } => {
                         // Parse dates in the resolved zone; error on invalid input.
-                        // `--to` is the exclusive end of a half-open range, so a
-                        // date-only value covers through the end of that local day.
-                        let from_dt = from
-                            .as_ref()
-                            .map(|s| crate::parsers::datetime::parse_datetime(s, tz))
-                            .transpose()?;
-                        let to_dt = to
-                            .as_ref()
-                            .map(|s| crate::parsers::datetime::parse_range_end(s, tz))
-                            .transpose()?;
+                        // Defaults: from = today, to = from + 30 days. `--to` is
+                        // the exclusive end of a half-open range, so a date-only
+                        // value covers through the end of that local day. Always
+                        // bounding the window also routes through the recurrence
+                        // <expand> path instead of returning unexpanded masters.
+                        let from_dt = match from.as_ref() {
+                            Some(s) => crate::parsers::datetime::parse_datetime(s, tz)?,
+                            None => crate::parsers::datetime::parse_datetime("today", tz)?,
+                        };
+                        let to_dt = match to.as_ref() {
+                            Some(s) => crate::parsers::datetime::parse_range_end(s, tz)?,
+                            None => from_dt + chrono::Duration::days(30),
+                        };
 
-                        events::list(&ctx, from_dt, to_dt).await
+                        events::list(&ctx, Some(from_dt), Some(to_dt)).await
                     }
                     EventCommands::Get { event_id } => events::get(&ctx, event_id).await,
                     EventCommands::Create {

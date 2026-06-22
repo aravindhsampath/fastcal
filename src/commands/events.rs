@@ -86,9 +86,6 @@ pub async fn list(
 
             println!("{}", serde_json::to_string_pretty(&response)?);
         }
-        OutputFormat::Ics => {
-            anyhow::bail!("ICS format not yet implemented");
-        }
     }
 
     Ok(())
@@ -134,9 +131,6 @@ pub async fn get(ctx: &crate::commands::context::CommandContext, event_id: Strin
                 "calendar": found_calendar,
             }));
             println!("{}", serde_json::to_string_pretty(&response)?);
-        }
-        OutputFormat::Ics => {
-            anyhow::bail!("ICS format not yet implemented");
         }
     }
 
@@ -345,9 +339,6 @@ pub async fn create(
                 }));
                 println!("{}", serde_json::to_string_pretty(&response)?);
             }
-            OutputFormat::Ics => {
-                anyhow::bail!("ICS format not yet implemented");
-            }
         }
         return Ok(());
     }
@@ -394,9 +385,6 @@ pub async fn create(
                 "message": "Event created successfully"
             }));
             println!("{}", serde_json::to_string_pretty(&response)?);
-        }
-        OutputFormat::Ics => {
-            anyhow::bail!("ICS format not yet implemented");
         }
     }
 
@@ -453,9 +441,6 @@ pub async fn delete(
                 }));
                 println!("{}", serde_json::to_string_pretty(&response)?);
             }
-            OutputFormat::Ics => {
-                anyhow::bail!("ICS format not yet implemented");
-            }
         }
         return Ok(());
     }
@@ -474,7 +459,8 @@ pub async fn delete(
         let mut input = String::new();
         std::io::stdin().read_line(&mut input)?;
 
-        if !input.trim().eq_ignore_ascii_case("y") {
+        let answer = input.trim().to_ascii_lowercase();
+        if answer != "y" && answer != "yes" {
             println!("Deletion cancelled");
             return Ok(());
         }
@@ -506,9 +492,6 @@ pub async fn delete(
                 "calendar": calendar_name,
             }));
             println!("{}", serde_json::to_string_pretty(&response)?);
-        }
-        OutputFormat::Ics => {
-            anyhow::bail!("ICS format not yet implemented");
         }
     }
 
@@ -736,9 +719,6 @@ pub async fn update(
                 }));
                 println!("{}", serde_json::to_string_pretty(&response)?);
             }
-            OutputFormat::Ics => {
-                anyhow::bail!("ICS format not yet implemented");
-            }
         }
         return Ok(());
     }
@@ -789,9 +769,6 @@ pub async fn update(
                 "message": "Event updated successfully"
             }));
             println!("{}", serde_json::to_string_pretty(&response)?);
-        }
-        OutputFormat::Ics => {
-            anyhow::bail!("ICS format not yet implemented");
         }
     }
 
@@ -909,9 +886,6 @@ pub async fn search(
 
             println!("{}", serde_json::to_string_pretty(&response)?);
         }
-        OutputFormat::Ics => {
-            anyhow::bail!("ICS format not yet implemented");
-        }
     }
 
     Ok(())
@@ -1022,9 +996,6 @@ pub async fn conflicts(
             }));
 
             println!("{}", serde_json::to_string_pretty(&response)?);
-        }
-        OutputFormat::Ics => {
-            anyhow::bail!("ICS format not yet implemented");
         }
     }
 

@@ -18,9 +18,5 @@ pub fn format_events(events: &[Event], format: OutputFormat, tz: Tz) -> Result<S
     match format {
         OutputFormat::Json => Ok(serde_json::to_string_pretty(events)?),
         OutputFormat::Text => text::format_events(events, tz),
-        OutputFormat::Ics => {
-            // ICS format would combine all events into a calendar
-            anyhow::bail!("ICS format not yet implemented")
-        }
     }
 }

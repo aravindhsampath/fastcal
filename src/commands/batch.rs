@@ -30,12 +30,34 @@ pub struct EventInput {
     pub description: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub attendees: Option<String>,
-    /// DISPLAY reminder N minutes before event start. `None` ⇒ no
-    /// reminder on this event. Exists on the shared batch input so
-    /// `fastcal batch create --from-json file.json` can carry
-    /// reminders per-event alongside the required fields.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub reminder_minutes: Option<u32>,
+    /// Zero or more DISPLAY reminders (minutes before start). In JSON this
+    /// accepts either a single number (`"reminder_minutes": 60`) or an array
+    /// (`[60, 1440]`); it is emitted as an array and omitted when empty.
+    #[serde(
+        default,
+        deserialize_with = "de_reminder_minutes",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub reminder_minutes: Vec<u32>,
+}
+
+/// Deserialize `reminder_minutes` from a single number, an array of numbers,
+/// or null — so older single-reminder JSON files still load.
+fn de_reminder_minutes<'de, D>(deserializer: D) -> Result<Vec<u32>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum OneOrMany {
+        One(u32),
+        Many(Vec<u32>),
+    }
+    Ok(match Option::<OneOrMany>::deserialize(deserializer)? {
+        None => Vec::new(),
+        Some(OneOrMany::One(n)) => vec![n],
+        Some(OneOrMany::Many(v)) => v,
+    })
 }
 
 /// Result of a single batch operation

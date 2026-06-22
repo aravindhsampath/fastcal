@@ -190,18 +190,16 @@ pub(crate) async fn create_event_on_server(
             .collect::<Vec<_>>()
     });
 
-    // Materialize a single-element Vec when a reminder was requested;
-    // empty otherwise. `build_event` emits exactly one VALARM per entry.
+    // One Reminder per requested offset; `build_event` emits one VALARM each.
     let reminders: Vec<Reminder> = event_input
         .reminder_minutes
-        .map(|m| {
-            vec![Reminder {
-                minutes_before: m,
-                action: "display".to_owned(),
-                description: None,
-            }]
+        .iter()
+        .map(|&m| Reminder {
+            minutes_before: m,
+            action: "display".to_owned(),
+            description: None,
         })
-        .unwrap_or_default();
+        .collect();
 
     // Build ICS event
     let ics_data = crate::parsers::ics::build_event(&crate::parsers::ics::IcsBuildArgs {
@@ -269,7 +267,7 @@ mod tests {
             location: None,
             description: None,
             attendees: None,
-            reminder_minutes: None,
+            reminder_minutes: Vec::new(),
         }
     }
 

@@ -151,11 +151,11 @@ pub enum EventCommands {
         #[arg(long)]
         attendees: Option<String>,
 
-        /// Set a DISPLAY reminder N minutes before the event start.
-        /// Repeat with larger numbers for hours / days
-        /// (e.g. 60 for 1 hour, 1440 for 1 day). Omit for no reminder.
+        /// Add a DISPLAY reminder N minutes before the event start
+        /// (e.g. 60 for 1 hour, 1440 for 1 day). Repeat the flag for
+        /// multiple reminders: `--reminder-minutes 60 --reminder-minutes 1440`.
         #[arg(long)]
-        reminder_minutes: Option<u32>,
+        reminder_minutes: Vec<u32>,
 
         /// Create event from JSON file (fields can be overridden by other flags)
         #[arg(long)]
@@ -190,11 +190,11 @@ pub enum EventCommands {
         #[arg(long)]
         attendees: Option<String>,
 
-        /// Replace all existing VALARMs with a single DISPLAY reminder
-        /// N minutes before start. Omit to leave the event's existing
-        /// reminders untouched; pass `--no-reminders` to strip them.
+        /// Replace all existing VALARMs with one DISPLAY reminder per flag,
+        /// N minutes before start (repeat for multiple). Omit to leave the
+        /// event's reminders untouched; pass `--no-reminders` to strip them.
         #[arg(long, conflicts_with = "no_reminders")]
-        reminder_minutes: Option<u32>,
+        reminder_minutes: Vec<u32>,
 
         /// Strip all VALARMs from the event. Mutually exclusive with
         /// `--reminder-minutes`.

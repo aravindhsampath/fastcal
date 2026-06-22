@@ -270,12 +270,8 @@ pub async fn test(ctx: &crate::commands::context::CommandContext) -> Result<()> 
 
     use libdav::caldav::FindCalendarHomeSet;
 
-    let principal_uri: http::Uri = principal_url
-        .parse()
-        .context("Failed to parse principal URL from config")?;
-
     match client
-        .request(FindCalendarHomeSet::new(&principal_uri))
+        .request(FindCalendarHomeSet::new(principal_url))
         .await
     {
         Ok(home_sets) => {

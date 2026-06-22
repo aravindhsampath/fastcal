@@ -18,13 +18,9 @@ pub async fn list_calendars(
 ) -> Result<HashMap<String, Calendar>> {
     log::info!("Listing calendars for principal: {}", principal_url);
 
-    let principal_uri: http::Uri = principal_url
-        .parse()
-        .context("Failed to parse principal URL")?;
-
-    // Find calendar home sets
+    // Find calendar home sets (libdav 0.10.5 takes the href as &str)
     let home_set_response = client
-        .request(FindCalendarHomeSet::new(&principal_uri))
+        .request(FindCalendarHomeSet::new(principal_url))
         .await
         .context("Failed to find calendar home sets")?;
 
@@ -39,13 +35,9 @@ pub async fn list_calendars(
     for home_set in &home_set_response.home_sets {
         log::debug!("Searching for calendars in: {}", home_set);
 
-        let home_set_uri: http::Uri = home_set
-            .to_string()
-            .parse()
-            .context("Failed to parse home set URL")?;
-
+        let home_set_href = home_set.to_string();
         let calendar_response = client
-            .request(FindCalendars::new(&home_set_uri))
+            .request(FindCalendars::new(&home_set_href))
             .await
             .context("Failed to find calendars")?;
 
